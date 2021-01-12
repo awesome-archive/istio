@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,14 +20,19 @@ package util
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"sync"
+	"time"
 )
 
 // KeyCertBundle stores the cert, private key, cert chain and root cert for an entity. It is thread safe.
+// TODO(myidpt): Remove this interface.
 type KeyCertBundle interface {
 	// GetAllPem returns all key/cert PEMs in KeyCertBundle together. Getting all values together avoids inconsistency.
 	GetAllPem() (certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte)
@@ -35,9 +40,26 @@ type KeyCertBundle interface {
 	// GetAll returns all key/cert in KeyCertBundle together. Getting all values together avoids inconsistency.
 	GetAll() (cert *x509.Certificate, privKey *crypto.PrivateKey, certChainBytes, rootCertBytes []byte)
 
+	// GetCertChainPem returns the certificate chain PEM.
+	GetCertChainPem() []byte
+
+	// GetRootCertPem returns the root certificate PEM.
+	GetRootCertPem() []byte
+
 	// VerifyAndSetAll verifies the key/certs, and sets all key/certs in KeyCertBundle together.
 	// Setting all values together avoids inconsistency.
 	VerifyAndSetAll(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error
+
+	// CertOptions returns the CertOptions for rotating the current key cert.
+	CertOptions() (*CertOptions, error)
+
+	// ExtractRootCertExpiryTimestamp returns the unix timestamp when the root becomes expires.
+	// An error indicates the certificate is expired.
+	ExtractRootCertExpiryTimestamp() (float64, error)
+
+	// ExtractCACertExpiryTimestamp returns the unix timestamp when the CA cert becomes expires.
+	// An error indicates the certificate is expired.
+	ExtractCACertExpiryTimestamp() (float64, error)
 }
 
 // KeyCertBundleImpl implements the KeyCertBundle interface.
@@ -55,7 +77,7 @@ type KeyCertBundleImpl struct {
 	mutex sync.RWMutex
 }
 
-// NewVerifiedKeyCertBundleFromPem returns a new KeyCertBundle, or error if if the provided certs failed the
+// NewVerifiedKeyCertBundleFromPem returns a new KeyCertBundle, or error if the provided certs failed the
 // verification.
 func NewVerifiedKeyCertBundleFromPem(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) (
 	*KeyCertBundleImpl, error) {
@@ -66,7 +88,7 @@ func NewVerifiedKeyCertBundleFromPem(certBytes, privKeyBytes, certChainBytes, ro
 	return bundle, nil
 }
 
-// NewVerifiedKeyCertBundleFromFile returns a new KeyCertBundle, or error if if the provided certs failed the
+// NewVerifiedKeyCertBundleFromFile returns a new KeyCertBundle, or error if the provided certs failed the
 // verification.
 func NewVerifiedKeyCertBundleFromFile(certFile, privKeyFile, certChainFile, rootCertFile string) (
 	*KeyCertBundleImpl, error) {
@@ -131,10 +153,24 @@ func (b *KeyCertBundleImpl) GetAll() (cert *x509.Certificate, privKey *crypto.Pr
 	return
 }
 
+// GetCertChainPem returns the certificate chain PEM.
+func (b *KeyCertBundleImpl) GetCertChainPem() []byte {
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
+	return copyBytes(b.certChainBytes)
+}
+
+// GetRootCertPem returns the root certificate PEM.
+func (b *KeyCertBundleImpl) GetRootCertPem() []byte {
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
+	return copyBytes(b.rootCertBytes)
+}
+
 // VerifyAndSetAll verifies the key/certs, and sets all key/certs in KeyCertBundle together.
 // Setting all values together avoids inconsistency.
 func (b *KeyCertBundleImpl) VerifyAndSetAll(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error {
-	if err := verify(certBytes, privKeyBytes, certChainBytes, rootCertBytes); err != nil {
+	if err := Verify(certBytes, privKeyBytes, certChainBytes, rootCertBytes); err != nil {
 		return err
 	}
 	b.mutex.Lock()
@@ -151,8 +187,71 @@ func (b *KeyCertBundleImpl) VerifyAndSetAll(certBytes, privKeyBytes, certChainBy
 	return nil
 }
 
-// verify that the cert chain, root cert and key/cert match.
-func verify(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error {
+// CertOptions returns the certificate config based on currently stored cert.
+func (b *KeyCertBundleImpl) CertOptions() (*CertOptions, error) {
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
+	ids, err := ExtractIDs(b.cert.Extensions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract id %v", err)
+	}
+	if len(ids) != 1 {
+		return nil, fmt.Errorf("expect single id from the cert, found %v", ids)
+	}
+
+	opts := &CertOptions{
+		Host:      ids[0],
+		Org:       b.cert.Issuer.Organization[0],
+		IsCA:      b.cert.IsCA,
+		TTL:       b.cert.NotAfter.Sub(b.cert.NotBefore),
+		IsDualUse: ids[0] == b.cert.Subject.CommonName,
+	}
+
+	switch (*b.privKey).(type) {
+	case *rsa.PrivateKey:
+		size, err := GetRSAKeySize(*b.privKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get RSA key size: %v", err)
+		}
+		opts.RSAKeySize = size
+	case *ecdsa.PrivateKey:
+		opts.ECSigAlg = EcdsaSigAlg
+	default:
+		return nil, errors.New("unknown private key type")
+	}
+
+	return opts, nil
+}
+
+// ExtractRootCertExpiryTimestamp returns the unix timestamp when the root becomes expires.
+func (b *KeyCertBundleImpl) ExtractRootCertExpiryTimestamp() (float64, error) {
+	return extractCertExpiryTimestamp("root cert", b.GetRootCertPem())
+}
+
+// ExtractCACertExpiryTimestamp returns the unix timestamp when the cert chain becomes expires.
+func (b *KeyCertBundleImpl) ExtractCACertExpiryTimestamp() (float64, error) {
+	return extractCertExpiryTimestamp("CA cert", b.GetCertChainPem())
+}
+
+// TimeBeforeCertExpires returns the time duration before the cert gets expired.
+// It returns an error if it failed to extract the cert expiration timestamp.
+// The returned time duration could be a negative value indicating the cert has already been expired.
+func TimeBeforeCertExpires(certBytes []byte, now time.Time) (time.Duration, error) {
+	if len(certBytes) == 0 {
+		return 0, fmt.Errorf("no certificate found")
+	}
+
+	certExpiryTimestamp, err := extractCertExpiryTimestamp("cert", certBytes)
+	if err != nil {
+		return 0, fmt.Errorf("failed to extract cert expiration timestamp: %v", err)
+	}
+
+	certExpiry := time.Duration(certExpiryTimestamp-float64(now.Unix())) * time.Second
+	return certExpiry, nil
+}
+
+// Verify that the cert chain, root cert and key/cert match.
+func Verify(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error {
 	// Verify the cert can be verified from the root cert through the cert chain.
 	rcp := x509.NewCertPool()
 	rcp.AppendCertsFromPEM(rootCertBytes)
@@ -172,7 +271,8 @@ func verify(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error
 
 	if len(chains) == 0 || err != nil {
 		return fmt.Errorf(
-			"cannot verify the cert with the provided root chain and cert pool")
+			"cannot verify the cert with the provided root chain and cert "+
+				"pool with error: %v", err)
 	}
 
 	// Verify that the key can be correctly parsed.
@@ -186,6 +286,20 @@ func verify(certBytes, privKeyBytes, certChainBytes, rootCertBytes []byte) error
 	}
 
 	return nil
+}
+
+func extractCertExpiryTimestamp(certType string, certPem []byte) (float64, error) {
+	cert, err := ParsePemEncodedCertificate(certPem)
+	if err != nil {
+		return -1, fmt.Errorf("failed to parse the %s: %v", certType, err)
+	}
+
+	end := cert.NotAfter
+	expiryTimestamp := float64(end.Unix())
+	if end.Before(time.Now()) {
+		return expiryTimestamp, fmt.Errorf("expired %s found, x509.NotAfter %v, please transit your %s", certType, end, certType)
+	}
+	return expiryTimestamp, nil
 }
 
 func copyBytes(src []byte) []byte {

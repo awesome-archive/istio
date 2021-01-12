@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,125 +11,311 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-package bootstrap_test
+package bootstrap
 
 import (
+	"bytes"
+	"crypto/tls"
 	"io/ioutil"
-	"net"
-	"net/http"
 	"os"
-	"strconv"
-	"strings"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
+	. "github.com/onsi/gomega"
 
-	"istio.io/istio/pilot/pkg/bootstrap"
-	envoy "istio.io/istio/pilot/pkg/proxy/envoy/v1"
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/serviceregistry"
+	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/testcerts"
+	"istio.io/pkg/filewatcher"
 )
 
-type env struct {
-	stop   chan struct{}
-	fsRoot string
+func TestNewServerWithExternalCertificates(t *testing.T) {
+	configDir, err := ioutil.TempDir("", "test_istiod_config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.RemoveAll(configDir)
+	}()
+
+	certsDir, err := ioutil.TempDir("", "test_istiod_certs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.RemoveAll(certsDir)
+	}()
+
+	certFile := filepath.Join(certsDir, "cert-file.pem")
+	keyFile := filepath.Join(certsDir, "key-file.pem")
+	caCertFile := filepath.Join(certsDir, "ca-cert.pem")
+
+	// load key and cert files.
+	if err := ioutil.WriteFile(certFile, testcerts.ServerCert, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", certFile, err)
+	}
+	if err := ioutil.WriteFile(keyFile, testcerts.ServerKey, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", keyFile, err)
+	}
+	if err := ioutil.WriteFile(caCertFile, testcerts.CACert, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", caCertFile, err)
+	}
+
+	tlsOptions := TLSOptions{
+		CertFile:   certFile,
+		KeyFile:    keyFile,
+		CaCertFile: caCertFile,
+	}
+
+	args := NewPilotArgs(func(p *PilotArgs) {
+		p.Namespace = "istio-system"
+		p.ServerOptions = DiscoveryServerOptions{
+			// Dynamically assign all ports.
+			HTTPAddr:       ":0",
+			MonitoringAddr: ":0",
+			GRPCAddr:       ":0",
+			SecureGRPCAddr: ":0",
+			TLSOptions:     tlsOptions,
+		}
+		p.RegistryOptions = RegistryOptions{
+			FileDir: configDir,
+		}
+
+		// Include all of the default plugins
+		p.Plugins = DefaultPlugins
+		p.ShutdownDuration = 1 * time.Millisecond
+	})
+
+	g := NewWithT(t)
+	s, err := NewServer(args)
+	g.Expect(err).To(Succeed())
+
+	stop := make(chan struct{})
+	features.EnableCAServer = false
+	g.Expect(s.Start(stop)).To(Succeed())
+	defer func() {
+		close(stop)
+		s.WaitUntilCompletion()
+	}()
+
+	// Validate server started with the provided cert
+	checkCert(t, s, testcerts.ServerCert, testcerts.ServerKey)
 }
 
-func (e *env) setup() (int, error) {
-	e.fsRoot = createTempDir()
-	e.stop = make(chan struct{})
-
-	// Create a test pilot discovery service configured to watch the tempDir.
-	args := bootstrap.PilotArgs{
-		Namespace: "testing",
-		DiscoveryOptions: envoy.DiscoveryServiceOptions{
-			Port:            0, // An unused port will be chosen
-			EnableCaching:   true,
-			EnableProfiling: true,
-		},
-		Mesh: bootstrap.MeshArgs{
-			MixerAddress:    "istio-mixer.istio-system:9091",
-			RdsRefreshDelay: ptypes.DurationProto(10 * time.Millisecond),
-		},
-		Config: bootstrap.ConfigArgs{
-			FileDir: e.fsRoot,
-		},
-		Service: bootstrap.ServiceArgs{
-			// Using the Mock service registry, which provides the hello and world services.
-			Registries: []string{string(bootstrap.MockRegistry)},
-		},
+func TestReloadIstiodCert(t *testing.T) {
+	dir, err := ioutil.TempDir("", "istiod_certs")
+	stop := make(chan struct{})
+	s := &Server{
+		fileWatcher: filewatcher.NewWatcher(),
 	}
 
-	// Create and setup the controller.
-	s, err := bootstrap.NewServer(args)
+	defer func() {
+		close(stop)
+		_ = s.fileWatcher.Close()
+		_ = os.RemoveAll(dir)
+	}()
 	if err != nil {
-		return 0, err
+		t.Fatalf("TempDir() failed: %v", err)
 	}
 
-	// Start the server.
-	addr, err := s.Start(e.stop)
+	certFile := filepath.Join(dir, "cert-file.yaml")
+	keyFile := filepath.Join(dir, "key-file.yaml")
+
+	// load key and cert files.
+	if err := ioutil.WriteFile(certFile, testcerts.ServerCert, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", certFile, err)
+	}
+	if err := ioutil.WriteFile(keyFile, testcerts.ServerKey, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", keyFile, err)
+	}
+
+	tlsOptions := TLSOptions{
+		CertFile: certFile,
+		KeyFile:  keyFile,
+	}
+
+	// setup cert watches.
+	err = s.initCertificateWatches(tlsOptions)
+	for _, fn := range s.startFuncs {
+		if err := fn(stop); err != nil {
+			t.Fatalf("Could not invoke startFuncs: %v", err)
+		}
+	}
+
 	if err != nil {
-		return 0, err
+		t.Fatalf("initCertificateWatches failed: %v", err)
 	}
 
-	// Extract the port from the network address.
-	_, port, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		return 0, err
+	// Validate that the certs are loaded.
+	checkCert(t, s, testcerts.ServerCert, testcerts.ServerKey)
+
+	// Update cert/key files.
+	if err := ioutil.WriteFile(tlsOptions.CertFile, testcerts.RotatedCert, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", tlsOptions.CertFile, err)
+	}
+	if err := ioutil.WriteFile(tlsOptions.KeyFile, testcerts.RotatedKey, 0644); err != nil { // nolint: vetshadow
+		t.Fatalf("WriteFile(%v) failed: %v", tlsOptions.KeyFile, err)
 	}
 
-	return strconv.Atoi(port)
+	g := NewWithT(t)
+
+	// Validate that istiod cert is updated.
+	g.Eventually(func() bool {
+		return checkCert(t, s, testcerts.RotatedCert, testcerts.RotatedKey)
+	}, "10s", "100ms").Should(BeTrue())
 }
 
-func (e *env) teardown() {
-	close(e.stop)
+func TestNewServer(t *testing.T) {
+	// All of the settings to apply and verify. Currently just testing domain suffix,
+	// but we should expand this list.
+	cases := []struct {
+		name           string
+		domain         string
+		expectedDomain string
+		secureGRPCport string
+	}{
+		{
+			name:           "default domain",
+			domain:         "",
+			expectedDomain: constants.DefaultKubernetesDomain,
+		},
+		{
+			name:           "override domain",
+			domain:         "mydomain.com",
+			expectedDomain: "mydomain.com",
+		},
+		{
+			name:           "override default secured grpc port",
+			domain:         "",
+			expectedDomain: constants.DefaultKubernetesDomain,
+			secureGRPCport: ":31128",
+		},
+	}
 
-	// Remove the temp dir.
-	_ = os.RemoveAll(e.fsRoot)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			configDir, err := ioutil.TempDir("", "TestNewServer")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer func() {
+				_ = os.RemoveAll(configDir)
+			}()
+
+			args := NewPilotArgs(func(p *PilotArgs) {
+				p.Namespace = "istio-system"
+				p.ServerOptions = DiscoveryServerOptions{
+					// Dynamically assign all ports.
+					HTTPAddr:       ":0",
+					MonitoringAddr: ":0",
+					GRPCAddr:       ":0",
+					SecureGRPCAddr: c.secureGRPCport,
+				}
+				p.RegistryOptions = RegistryOptions{
+					KubeOptions: kubecontroller.Options{
+						DomainSuffix: c.domain,
+					},
+					FileDir: configDir,
+				}
+
+				// Include all of the default plugins
+				p.Plugins = DefaultPlugins
+				p.ShutdownDuration = 1 * time.Millisecond
+			})
+
+			g := NewWithT(t)
+			s, err := NewServer(args)
+			g.Expect(err).To(Succeed())
+
+			stop := make(chan struct{})
+			g.Expect(s.Start(stop)).To(Succeed())
+			defer func() {
+				close(stop)
+				s.WaitUntilCompletion()
+			}()
+
+			g.Expect(s.environment.GetDomainSuffix()).To(Equal(c.expectedDomain))
+		})
+	}
 }
 
-func createTempDir() string {
-	// Make the temporary directory
-	dir, _ := ioutil.TempDir("/tmp/", "monitor")
-	_ = os.MkdirAll(dir, os.ModeDir|os.ModePerm)
-	return dir
+func TestNewServerWithMockRegistry(t *testing.T) {
+	cases := []struct {
+		name             string
+		registry         string
+		expectedRegistry serviceregistry.ProviderID
+		secureGRPCport   string
+	}{
+		{
+			name:             "Mock Registry",
+			registry:         "Mock",
+			expectedRegistry: serviceregistry.Mock,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			configDir, err := ioutil.TempDir("", "TestNewServer")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer func() {
+				_ = os.RemoveAll(configDir)
+			}()
+
+			args := NewPilotArgs(func(p *PilotArgs) {
+				p.Namespace = "istio-system"
+
+				// As the same with args in main go of pilot-discovery
+				p.InjectionOptions = InjectionOptions{
+					InjectionDirectory: "./var/lib/istio/inject",
+				}
+
+				p.ServerOptions = DiscoveryServerOptions{
+					// Dynamically assign all ports.
+					HTTPAddr:       ":0",
+					MonitoringAddr: ":0",
+					GRPCAddr:       ":0",
+					SecureGRPCAddr: c.secureGRPCport,
+				}
+
+				p.RegistryOptions = RegistryOptions{
+					Registries: []string{c.registry},
+					FileDir:    configDir,
+				}
+
+				// Include all of the default plugins
+				p.Plugins = DefaultPlugins
+				p.ShutdownDuration = 1 * time.Millisecond
+			})
+
+			g := NewWithT(t)
+			s, err := NewServer(args)
+			g.Expect(err).To(Succeed())
+
+			stop := make(chan struct{})
+			g.Expect(s.Start(stop)).To(Succeed())
+			defer func() {
+				close(stop)
+				s.WaitUntilCompletion()
+			}()
+
+			g.Expect(s.ServiceController().GetRegistries()[1].Provider()).To(Equal(c.expectedRegistry))
+		})
+	}
 }
 
-// TestListServices verifies that the mock services are available on the Pilot discovery service
-func TestListServices(t *testing.T) {
-	e := env{}
-	port, err := e.setup()
+func checkCert(t *testing.T, s *Server, cert, key []byte) bool {
+	t.Helper()
+	actual, _ := s.getIstiodCertificate(nil)
+	expected, err := tls.X509KeyPair(cert, key)
 	if err != nil {
-		t.Error(err)
+		t.Fatalf("fail to load test certs.")
 	}
-	defer e.teardown()
-
-	// Wait a bit for the server to come up.
-	// TODO(nmittler): Change to polling health endpoint once https://github.com/istio/istio/pull/2002 lands.
-	time.Sleep(time.Second)
-
-	url := "http://localhost:" + strconv.Itoa(port) + "/v1/registration"
-	resp, err := http.Get(url)
-	if err != nil {
-		t.Error(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		t.Errorf("Response had unexpected status: %d", resp.StatusCode)
-	}
-	bodyBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Errorf("Failed reading response body")
-	}
-
-	bodyString := string(bodyBytes)
-
-	// Verify that the hello and world mock services are available.
-	if !strings.Contains(bodyString, "hello.default.svc.cluster.local") {
-		t.Errorf("Response missing hello service")
-	}
-	if !strings.Contains(bodyString, "world.default.svc.cluster.local") {
-		t.Errorf("Response missing world service")
-	}
+	return bytes.Equal(actual.Certificate[0], expected.Certificate[0])
 }

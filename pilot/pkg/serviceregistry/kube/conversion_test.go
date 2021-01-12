@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,49 +15,114 @@
 package kube
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
-	"k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	coreV1 "k8s.io/api/core/v1"
+	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	meshconfig "istio.io/api/mesh/v1alpha1"
-	"istio.io/istio/pilot/pkg/model"
+	"istio.io/api/annotation"
+	"istio.io/istio/pkg/config/kube"
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/spiffe"
 )
 
 var (
 	domainSuffix = "company.com"
-
-	protocols = []struct {
-		name  string
-		proto v1.Protocol
-		out   model.Protocol
-	}{
-		{"", v1.ProtocolTCP, model.ProtocolTCP},
-		{"http", v1.ProtocolTCP, model.ProtocolHTTP},
-		{"http-test", v1.ProtocolTCP, model.ProtocolHTTP},
-		{"http", v1.ProtocolUDP, model.ProtocolUDP},
-		{"httptest", v1.ProtocolTCP, model.ProtocolTCP},
-		{"https", v1.ProtocolTCP, model.ProtocolHTTPS},
-		{"https-test", v1.ProtocolTCP, model.ProtocolHTTPS},
-		{"http2", v1.ProtocolTCP, model.ProtocolHTTP2},
-		{"http2-test", v1.ProtocolTCP, model.ProtocolHTTP2},
-		{"grpc", v1.ProtocolTCP, model.ProtocolGRPC},
-		{"grpc-test", v1.ProtocolTCP, model.ProtocolGRPC},
-		{"mongo", v1.ProtocolTCP, model.ProtocolMongo},
-		{"mongo-test", v1.ProtocolTCP, model.ProtocolMongo},
-		{"redis", v1.ProtocolTCP, model.ProtocolRedis},
-		{"redis-test", v1.ProtocolTCP, model.ProtocolRedis},
-	}
+	clusterID    = "test-cluster"
 )
 
 func TestConvertProtocol(t *testing.T) {
-	for _, tt := range protocols {
-		out := ConvertProtocol(tt.name, tt.proto)
-		if out != tt.out {
-			t.Errorf("convertProtocol(%q, %q) => %q, want %q", tt.name, tt.proto, out, tt.out)
+	http := "http"
+	type protocolCase struct {
+		port        int32
+		name        string
+		appProtocol *string
+		proto       coreV1.Protocol
+		out         protocol.Instance
+	}
+	protocols := []protocolCase{
+		{8888, "", nil, coreV1.ProtocolTCP, protocol.Unsupported},
+		{25, "", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{53, "", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{3306, "", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{27017, "", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{8888, "http", nil, coreV1.ProtocolTCP, protocol.HTTP},
+		{8888, "http-test", nil, coreV1.ProtocolTCP, protocol.HTTP},
+		{8888, "http", nil, coreV1.ProtocolUDP, protocol.UDP},
+		{8888, "httptest", nil, coreV1.ProtocolTCP, protocol.Unsupported},
+		{25, "httptest", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{53, "httptest", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{3306, "httptest", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{27017, "httptest", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{8888, "https", nil, coreV1.ProtocolTCP, protocol.HTTPS},
+		{8888, "https-test", nil, coreV1.ProtocolTCP, protocol.HTTPS},
+		{8888, "http2", nil, coreV1.ProtocolTCP, protocol.HTTP2},
+		{8888, "http2-test", nil, coreV1.ProtocolTCP, protocol.HTTP2},
+		{8888, "grpc", nil, coreV1.ProtocolTCP, protocol.GRPC},
+		{8888, "grpc-test", nil, coreV1.ProtocolTCP, protocol.GRPC},
+		{8888, "grpc-web", nil, coreV1.ProtocolTCP, protocol.GRPCWeb},
+		{8888, "grpc-web-test", nil, coreV1.ProtocolTCP, protocol.GRPCWeb},
+		{8888, "mongo", nil, coreV1.ProtocolTCP, protocol.Mongo},
+		{8888, "mongo-test", nil, coreV1.ProtocolTCP, protocol.Mongo},
+		{8888, "redis", nil, coreV1.ProtocolTCP, protocol.Redis},
+		{8888, "redis-test", nil, coreV1.ProtocolTCP, protocol.Redis},
+		{8888, "mysql", nil, coreV1.ProtocolTCP, protocol.MySQL},
+		{8888, "mysql-test", nil, coreV1.ProtocolTCP, protocol.MySQL},
+		{8888, "tcp", &http, coreV1.ProtocolTCP, protocol.HTTP},
+	}
+
+	// Create the list of cases for all of the names in both upper and lowercase.
+	cases := make([]protocolCase, 0, len(protocols)*2)
+	for _, p := range protocols {
+		name := p.name
+
+		p.name = strings.ToLower(name)
+		cases = append(cases, p)
+
+		// Don't bother adding uppercase version for empty string.
+		if name != "" {
+			p.name = strings.ToUpper(name)
+			cases = append(cases, p)
 		}
+	}
+
+	for _, c := range cases {
+		testName := strings.Replace(fmt.Sprintf("%s_%s_%d", c.name, c.proto, c.port), "-", "_", -1)
+		t.Run(testName, func(t *testing.T) {
+			out := kube.ConvertProtocol(c.port, c.name, c.proto, c.appProtocol)
+			if out != c.out {
+				t.Fatalf("convertProtocol(%d, %q, %q) => %q, want %q", c.port, c.name, c.proto, out, c.out)
+			}
+		})
+	}
+}
+
+func BenchmarkConvertProtocol(b *testing.B) {
+	cases := []struct {
+		name  string
+		proto coreV1.Protocol
+		out   protocol.Instance
+	}{
+		{"grpc-web-lowercase", coreV1.ProtocolTCP, protocol.GRPCWeb},
+		{"GRPC-WEB-mixedcase", coreV1.ProtocolTCP, protocol.GRPCWeb},
+		{"https-lowercase", coreV1.ProtocolTCP, protocol.HTTPS},
+		{"HTTPS-mixedcase", coreV1.ProtocolTCP, protocol.HTTPS},
+	}
+
+	for _, c := range cases {
+		testName := strings.Replace(c.name, "-", "_", -1)
+		b.Run(testName, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				out := kube.ConvertProtocol(8888, c.name, c.proto, nil)
+				if out != c.out {
+					b.Fatalf("convertProtocol(%q, %q) => %q, want %q", c.name, c.proto, out, c.out)
+				}
+			}
+		})
 	}
 }
 
@@ -66,73 +131,88 @@ func TestServiceConversion(t *testing.T) {
 	namespace := "default"
 	saA := "serviceaccountA"
 	saB := "serviceaccountB"
-	saC := "serviceaccountC@cloudservices.gserviceaccount.com"
-	saD := "serviceaccountD@developer.gserviceaccount.com"
+	saC := "spiffe://accounts.google.com/serviceaccountC@cloudservices.gserviceaccount.com"
+	saD := "spiffe://accounts.google.com/serviceaccountD@developer.gserviceaccount.com"
+
+	oldTrustDomain := spiffe.GetTrustDomain()
+	spiffe.SetTrustDomain(domainSuffix)
+	defer spiffe.SetTrustDomain(oldTrustDomain)
 
 	ip := "10.0.0.1"
 
-	localSvc := v1.Service{
-		ObjectMeta: metav1.ObjectMeta{
+	tnow := time.Now()
+	localSvc := coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{
 			Name:      serviceName,
 			Namespace: namespace,
 			Annotations: map[string]string{
-				KubeServiceAccountsOnVMAnnotation:      saA + "," + saB,
-				CanonicalServiceAccountsOnVMAnnotation: saC + "," + saD,
-				"other/annotation":                     "test",
+				annotation.AlphaKubernetesServiceAccounts.Name: saA + "," + saB,
+				annotation.AlphaCanonicalServiceAccounts.Name:  saC + "," + saD,
+				"other/annotation": "test",
 			},
+			CreationTimestamp: metaV1.Time{Time: tnow},
 		},
-		Spec: v1.ServiceSpec{
+		Spec: coreV1.ServiceSpec{
 			ClusterIP: ip,
-			Ports: []v1.ServicePort{
+			Selector:  map[string]string{"foo": "bar"},
+			Ports: []coreV1.ServicePort{
 				{
 					Name:     "http",
 					Port:     8080,
-					Protocol: v1.ProtocolTCP,
+					Protocol: coreV1.ProtocolTCP,
 				},
 				{
 					Name:     "https",
-					Protocol: v1.ProtocolTCP,
+					Protocol: coreV1.ProtocolTCP,
 					Port:     443,
 				},
 			},
 		},
 	}
 
-	service := convertService(localSvc, domainSuffix)
+	service := ConvertService(localSvc, domainSuffix, clusterID)
 	if service == nil {
-		t.Errorf("could not convert service")
+		t.Fatalf("could not convert service")
+	}
+
+	if service.CreationTime != tnow {
+		t.Fatalf("incorrect creation time => %v, want %v", service.CreationTime, tnow)
 	}
 
 	if len(service.Ports) != len(localSvc.Spec.Ports) {
-		t.Errorf("incorrect number of ports => %v, want %v",
+		t.Fatalf("incorrect number of ports => %v, want %v",
 			len(service.Ports), len(localSvc.Spec.Ports))
 	}
 
 	if service.External() {
-		t.Error("service should not be external")
+		t.Fatal("service should not be external")
 	}
 
-	if service.Hostname != serviceHostname(serviceName, namespace, domainSuffix) {
-		t.Errorf("service hostname incorrect => %q, want %q",
-			service.Hostname, serviceHostname(serviceName, namespace, domainSuffix))
+	if service.Hostname != ServiceHostname(serviceName, namespace, domainSuffix) {
+		t.Fatalf("service hostname incorrect => %q, want %q",
+			service.Hostname, ServiceHostname(serviceName, namespace, domainSuffix))
 	}
 
 	if service.Address != ip {
-		t.Errorf("service IP incorrect => %q, want %q", service.Address, ip)
+		t.Fatalf("service IP incorrect => %q, want %q", service.Address, ip)
+	}
+
+	if !reflect.DeepEqual(service.Attributes.LabelSelectors, localSvc.Spec.Selector) {
+		t.Fatalf("service label selectors incorrect => %q, want %q", service.Attributes.LabelSelectors,
+			localSvc.Spec.Selector)
 	}
 
 	sa := service.ServiceAccounts
 	if sa == nil || len(sa) != 4 {
-		t.Errorf("number of service accounts is incorrect")
+		t.Fatalf("number of service accounts is incorrect")
 	}
 	expected := []string{
+		saC, saD,
 		"spiffe://company.com/ns/default/sa/" + saA,
 		"spiffe://company.com/ns/default/sa/" + saB,
-		"spiffe://" + saC,
-		"spiffe://" + saD,
 	}
 	if !reflect.DeepEqual(sa, expected) {
-		t.Errorf("Unexpected service accounts %v (expecting %v)", sa, expected)
+		t.Fatalf("Unexpected service accounts %v (expecting %v)", sa, expected)
 	}
 }
 
@@ -142,284 +222,206 @@ func TestServiceConversionWithEmptyServiceAccountsAnnotation(t *testing.T) {
 
 	ip := "10.0.0.1"
 
-	localSvc := v1.Service{
-		ObjectMeta: metav1.ObjectMeta{
+	localSvc := coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{
 			Name:        serviceName,
 			Namespace:   namespace,
 			Annotations: map[string]string{},
 		},
-		Spec: v1.ServiceSpec{
+		Spec: coreV1.ServiceSpec{
 			ClusterIP: ip,
-			Ports: []v1.ServicePort{
+			Ports: []coreV1.ServicePort{
 				{
 					Name:     "http",
 					Port:     8080,
-					Protocol: v1.ProtocolTCP,
+					Protocol: coreV1.ProtocolTCP,
 				},
 				{
 					Name:     "https",
-					Protocol: v1.ProtocolTCP,
+					Protocol: coreV1.ProtocolTCP,
 					Port:     443,
 				},
 			},
 		},
 	}
 
-	service := convertService(localSvc, domainSuffix)
+	service := ConvertService(localSvc, domainSuffix, clusterID)
 	if service == nil {
-		t.Errorf("could not convert service")
+		t.Fatalf("could not convert service")
 	}
 
 	sa := service.ServiceAccounts
 	if len(sa) != 0 {
-		t.Errorf("number of service accounts is incorrect: %d, expected 0", len(sa))
+		t.Fatalf("number of service accounts is incorrect: %d, expected 0", len(sa))
 	}
-}
-
-func TestServiceSecurityAnnotation(t *testing.T) {
-	serviceName := "service1"
-	namespace := "default"
-
-	ip := "10.0.0.1"
-
-	testCases := []struct {
-		port            int
-		annotationValue string
-		want            meshconfig.AuthenticationPolicy
-	}{
-		{8080, "MUTUAL_TLS", meshconfig.AuthenticationPolicy_MUTUAL_TLS},
-		{8080, "NONE", meshconfig.AuthenticationPolicy_NONE},
-		{8080, "invalid-option", meshconfig.AuthenticationPolicy_INHERIT},
-		{8080, "", meshconfig.AuthenticationPolicy_INHERIT},
-		// Annotation is not for the testing port (8080), default policy (INHERIT)
-		// should be set.
-		{9999, "MUTUAL_TLS", meshconfig.AuthenticationPolicy_INHERIT},
-		// No annotation
-		{0, "", meshconfig.AuthenticationPolicy_INHERIT},
-	}
-	for _, test := range testCases {
-		localSvc := v1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      serviceName,
-				Namespace: namespace,
-				Annotations: func() map[string]string {
-					if test.port > 0 {
-						return map[string]string{portAuthenticationAnnotationKey(test.port): test.annotationValue}
-					}
-					return nil
-				}(),
-			},
-			Spec: v1.ServiceSpec{
-				ClusterIP: ip,
-				Ports: []v1.ServicePort{
-					{
-						Name:     "http",
-						Port:     8080,
-						Protocol: v1.ProtocolTCP,
-					},
-				},
-			},
-		}
-
-		service := convertService(localSvc, domainSuffix)
-		if service == nil {
-			t.Errorf("could not convert service")
-		}
-
-		if len(service.Ports) != 1 {
-			t.Errorf("incorrect number of ports => %v, want 1\n",
-				len(service.Ports))
-		}
-
-		if service.Ports[0].AuthenticationPolicy != test.want {
-			t.Errorf("incorrect authentication policy => %v, want %v\n",
-				service.Ports[0].AuthenticationPolicy,
-				test.want)
-		}
-	}
-
 }
 
 func TestExternalServiceConversion(t *testing.T) {
 	serviceName := "service1"
 	namespace := "default"
 
-	extSvc := v1.Service{
-		ObjectMeta: metav1.ObjectMeta{
+	extSvc := coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{
 			Name:      serviceName,
 			Namespace: namespace,
 		},
-		Spec: v1.ServiceSpec{
-			Ports: []v1.ServicePort{
+		Spec: coreV1.ServiceSpec{
+			Ports: []coreV1.ServicePort{
 				{
 					Name:     "http",
 					Port:     80,
-					Protocol: v1.ProtocolTCP,
+					Protocol: coreV1.ProtocolTCP,
 				},
 			},
-			Type:         v1.ServiceTypeExternalName,
+			Type:         coreV1.ServiceTypeExternalName,
 			ExternalName: "google.com",
 		},
 	}
 
-	service := convertService(extSvc, domainSuffix)
+	service := ConvertService(extSvc, domainSuffix, clusterID)
 	if service == nil {
-		t.Errorf("could not convert external service")
+		t.Fatalf("could not convert external service")
 	}
 
 	if len(service.Ports) != len(extSvc.Spec.Ports) {
-		t.Errorf("incorrect number of ports => %v, want %v",
+		t.Fatalf("incorrect number of ports => %v, want %v",
 			len(service.Ports), len(extSvc.Spec.Ports))
 	}
 
-	if service.ExternalName != extSvc.Spec.ExternalName || !service.External() {
-		t.Error("service should be external")
+	if !service.External() {
+		t.Fatal("service should be external")
 	}
 
-	if service.Hostname != serviceHostname(serviceName, namespace, domainSuffix) {
-		t.Errorf("service hostname incorrect => %q, want %q",
-			service.Hostname, extSvc.Spec.ExternalName)
+	if service.Hostname != ServiceHostname(serviceName, namespace, domainSuffix) {
+		t.Fatalf("service hostname incorrect => %q, want %q",
+			service.Hostname, ServiceHostname(serviceName, namespace, domainSuffix))
 	}
 }
 
-func TestProbesToPortsConversion(t *testing.T) {
+func TestExternalClusterLocalServiceConversion(t *testing.T) {
+	serviceName := "service1"
+	namespace := "default"
 
-	expected := model.PortList{
-		{
-			Name:     "mgmt-3306",
-			Port:     3306,
-			Protocol: model.ProtocolTCP,
+	extSvc := coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: namespace,
 		},
-		{
-			Name:     "mgmt-9080",
-			Port:     9080,
-			Protocol: model.ProtocolHTTP,
-		},
-	}
-
-	handlers := []v1.Handler{
-		{
-			TCPSocket: &v1.TCPSocketAction{
-				Port: intstr.IntOrString{StrVal: "mysql", Type: intstr.String},
-			},
-		},
-		{
-			TCPSocket: &v1.TCPSocketAction{
-				Port: intstr.IntOrString{IntVal: 3306, Type: intstr.Int},
-			},
-		},
-		{
-			HTTPGet: &v1.HTTPGetAction{
-				Path: "/foo",
-				Port: intstr.IntOrString{StrVal: "http-two", Type: intstr.String},
-			},
-		},
-		{
-			HTTPGet: &v1.HTTPGetAction{
-				Path: "/foo",
-				Port: intstr.IntOrString{IntVal: 9080, Type: intstr.Int},
-			},
-		},
-	}
-
-	podSpec := &v1.PodSpec{
-		Containers: []v1.Container{
-			{
-				Name: "scooby",
-				Ports: []v1.ContainerPort{
-					{
-						Name:          "mysql",
-						ContainerPort: 3306,
-					},
-					{
-						Name:          "http-two",
-						ContainerPort: 9080,
-					},
-					{
-						Name:          "http",
-						ContainerPort: 80,
-					},
+		Spec: coreV1.ServiceSpec{
+			Ports: []coreV1.ServicePort{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: coreV1.ProtocolTCP,
 				},
-				LivenessProbe:  &v1.Probe{},
-				ReadinessProbe: &v1.Probe{},
+			},
+			Type:         coreV1.ServiceTypeExternalName,
+			ExternalName: "some.test.svc.cluster.local",
+		},
+	}
+
+	domainSuffix := "cluster.local"
+
+	service := ConvertService(extSvc, domainSuffix, clusterID)
+	if service == nil {
+		t.Fatalf("could not convert external service")
+	}
+
+	if len(service.Ports) != len(extSvc.Spec.Ports) {
+		t.Fatalf("incorrect number of ports => %v, want %v",
+			len(service.Ports), len(extSvc.Spec.Ports))
+	}
+
+	if !service.External() {
+		t.Fatal("ExternalName service (even if .cluster.local) should be external")
+	}
+
+	if service.Hostname != ServiceHostname(serviceName, namespace, domainSuffix) {
+		t.Fatalf("service hostname incorrect => %q, want %q",
+			service.Hostname, ServiceHostname(serviceName, namespace, domainSuffix))
+	}
+}
+
+func TestLBServiceConversion(t *testing.T) {
+	serviceName := "service1"
+	namespace := "default"
+
+	addresses := []coreV1.LoadBalancerIngress{
+		{
+			IP: "127.68.32.112",
+		},
+		{
+			IP: "127.68.32.113",
+		},
+		{
+			Hostname: "127.68.32.114",
+		},
+		{
+			Hostname: "127.68.32.115",
+		},
+	}
+
+	extSvc := coreV1.Service{
+		ObjectMeta: metaV1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: namespace,
+		},
+		Spec: coreV1.ServiceSpec{
+			Ports: []coreV1.ServicePort{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: coreV1.ProtocolTCP,
+				},
+			},
+			Type: coreV1.ServiceTypeLoadBalancer,
+		},
+		Status: coreV1.ServiceStatus{
+			LoadBalancer: coreV1.LoadBalancerStatus{
+				Ingress: addresses,
 			},
 		},
 	}
 
-	for _, handler1 := range handlers {
-		for _, handler2 := range handlers {
-			if (handler1.TCPSocket != nil && handler2.TCPSocket != nil) ||
-				(handler1.HTTPGet != nil && handler2.HTTPGet != nil) {
-				continue
-			}
+	service := ConvertService(extSvc, domainSuffix, clusterID)
+	if service == nil {
+		t.Fatalf("could not convert external service")
+	}
 
-			podSpec.Containers[0].LivenessProbe.Handler = handler1
-			podSpec.Containers[0].ReadinessProbe.Handler = handler2
+	if len(service.Attributes.ClusterExternalAddresses[clusterID]) == 0 {
+		t.Fatalf("no load balancer addresses found")
+	}
 
-			mgmtPorts, err := convertProbesToPorts(podSpec)
-			if err != nil {
-				t.Errorf("Failed to convert Probes to Ports: %v", err)
-			}
-
-			if !reflect.DeepEqual(mgmtPorts, expected) {
-				t.Errorf("incorrect number of management ports => %v, want %v",
-					len(mgmtPorts), len(expected))
-			}
+	for i, addr := range addresses {
+		var want string
+		if len(addr.IP) > 0 {
+			want = addr.IP
+		} else {
+			want = addr.Hostname
+		}
+		got := service.Attributes.ClusterExternalAddresses[clusterID][i]
+		if got != want {
+			t.Fatalf("Expected address %s but got %s", want, got)
 		}
 	}
 }
 
-func TestParseKubeServiceNode(t *testing.T) {
-	var svcNode model.Proxy
-	ipaddr := "128.0.0.1"
-	kubeNodes := make(map[string]*kubeServiceNode)
+func TestSecureNamingSAN(t *testing.T) {
 
-	svcNode.ID = "router.default"
-	svcNode.Domain = "default.svc.cluster.local"
+	pod := &coreV1.Pod{}
 
-	err := parseKubeServiceNode(ipaddr, &svcNode, kubeNodes)
-	if err != nil {
-		t.Errorf("expected successful return from parseKubeServiceNode, "+
-			"got err = %v", err)
-	}
+	pod.Annotations = make(map[string]string)
 
-	if kubeNodes[ipaddr].PodName != "router" || kubeNodes[ipaddr].Domain != svcNode.Domain ||
-		kubeNodes[ipaddr].Namespace != "default" {
-		t.Errorf("invalid kubeNodes, expected PodName=router got %s "+
-			"expected Domain=%s got %s expected Namespace='default' got %s",
-			kubeNodes[ipaddr].PodName, svcNode.Domain, kubeNodes[ipaddr].Domain,
-			kubeNodes[ipaddr].Namespace)
-	}
-}
+	ns := "anything"
+	sa := "foo"
+	pod.Namespace = ns
+	pod.Spec.ServiceAccountName = sa
 
-func TestParseKubeServiceNodeErrors(t *testing.T) {
-	var svcNode model.Proxy
-	ipaddr := "128.0.0.1"
-	kubeNodes := make(map[string]*kubeServiceNode)
+	san := SecureNamingSAN(pod)
 
-	svcNode.ID = "invalidID"
-	err := parseKubeServiceNode(ipaddr, &svcNode, kubeNodes)
-	if err == nil {
-		t.Errorf("expected 'invalid ID' error message")
-	}
+	expectedSAN := fmt.Sprintf("spiffe://%v/ns/%v/sa/%v", spiffe.GetTrustDomain(), ns, sa)
 
-	svcNode.ID = "router.default"
-	svcNode.Domain = "invalid.domain"
-	err = parseKubeServiceNode(ipaddr, &svcNode, kubeNodes)
-	if err == nil {
-		t.Errorf("expected 'invalid node domain format' error message")
-	}
-
-	svcNode.Domain = "default.svc.cluster.localinvalid"
-	err = parseKubeServiceNode(ipaddr, &svcNode, kubeNodes)
-	if err == nil {
-		t.Errorf("expected 'invalid node domain' error message")
-	}
-
-	svcNode.ID = "router.defaultDifferentNamespace"
-	svcNode.Domain = "default.svc.cluster.local"
-	err = parseKubeServiceNode(ipaddr, &svcNode, kubeNodes)
-	if err == nil {
-		t.Errorf("expected 'namespace in ID must be equal' error message")
+	if san != expectedSAN {
+		t.Fatalf("SAN match failed, SAN:%v  expectedSAN:%v", san, expectedSAN)
 	}
 }

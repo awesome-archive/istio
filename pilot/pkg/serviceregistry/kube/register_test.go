@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package kube
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 )
 
 func TestStr2NamedPort(t *testing.T) {
@@ -42,7 +42,7 @@ func TestStr2NamedPort(t *testing.T) {
 		}
 		if tst.expErr {
 			if actErr == nil {
-				t.Errorf("Got no error when expecting an error for for Str2NamedPort('%s')", tst.input)
+				t.Errorf("Got no error when expecting an error for Str2NamedPort('%s')", tst.input)
 			}
 		} else {
 			if actErr != nil {

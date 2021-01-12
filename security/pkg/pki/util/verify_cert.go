@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package util
 
 import (
+	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
@@ -24,7 +25,7 @@ import (
 	"time"
 )
 
-// VerifyFields contains the certficate fields to verify in the test.
+// VerifyFields contains the certificate fields to verify in the test.
 type VerifyFields struct {
 	NotBefore   time.Time
 	TTL         time.Duration // NotAfter - NotBefore
@@ -32,13 +33,14 @@ type VerifyFields struct {
 	KeyUsage    x509.KeyUsage
 	IsCA        bool
 	Org         string
+	CommonName  string
+	Host        string
 }
 
 // VerifyCertificate verifies a given PEM encoded certificate by
 // - building one or more chains from the certificate to a root certificate;
 // - checking fields are set as expected.
-func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte,
-	host string, expectedFields *VerifyFields) error {
+func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte, expectedFields *VerifyFields) error {
 
 	roots := x509.NewCertPool()
 	if rootCertPem != nil {
@@ -57,6 +59,7 @@ func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte,
 		return err
 	}
 
+	host := expectedFields.Host
 	san := host
 	// uri scheme is currently not supported in go VerifyOptions. We verify
 	// this uri at the end as a special case.
@@ -79,14 +82,35 @@ func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte,
 		return err
 	}
 
-	if !reflect.DeepEqual(priv.(*rsa.PrivateKey).PublicKey, *cert.PublicKey.(*rsa.PublicKey)) {
-		return fmt.Errorf("the generated private key and cert doesn't match")
+	privRSAKey, privRSAOk := priv.(*rsa.PrivateKey)
+	pubRSAKey, pubRSAOk := cert.PublicKey.(*rsa.PublicKey)
+
+	privECKey, privECOk := priv.(*ecdsa.PrivateKey)
+	pubECKey, pubECOk := cert.PublicKey.(*ecdsa.PublicKey)
+
+	rsaMatch := privRSAOk && pubRSAOk
+	ecMatch := privECOk && pubECOk
+
+	if rsaMatch {
+		if !reflect.DeepEqual(privRSAKey.PublicKey, *pubRSAKey) {
+			return fmt.Errorf("the generated private RSA key and cert doesn't match")
+		}
+	} else if ecMatch {
+		if !reflect.DeepEqual(privECKey.PublicKey, *pubECKey) {
+			return fmt.Errorf("the generated private EC key and cert doesn't match")
+		}
+	} else {
+		return fmt.Errorf("algorithms for private key and cert do not match")
 	}
 
 	if strings.HasPrefix(host, "spiffe") {
 		matchHost := false
-		for _, e := range cert.Extensions {
-			if strings.HasSuffix(string(e.Value[:]), host) {
+		ids, err := ExtractIDs(cert.Extensions)
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if strings.HasSuffix(id, host) {
 				matchHost = true
 				break
 			}
@@ -119,6 +143,11 @@ func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte,
 	if org := expectedFields.Org; org != "" && !reflect.DeepEqual([]string{org}, cert.Issuer.Organization) {
 		return fmt.Errorf("unexpected value for 'Organization' field: want %v but got %v",
 			[]string{org}, cert.Issuer.Organization)
+	}
+
+	if cn := expectedFields.CommonName; cn != cert.Subject.CommonName {
+		return fmt.Errorf("unexpected value for 'CommonName' field: want %v but got %v",
+			cn, cert.Subject.CommonName)
 	}
 
 	return nil

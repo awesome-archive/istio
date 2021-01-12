@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors.
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,270 +15,164 @@
 package model
 
 import (
-	"errors"
-	"reflect"
-	"strings"
+	"fmt"
 	"testing"
 
-	routing "istio.io/api/routing/v1alpha2"
-)
-
-var (
-	tlsOne = &routing.Server_TLSOptions{
-		HttpsRedirect: false,
-	}
-	tlsTwo = &routing.Server_TLSOptions{
-		HttpsRedirect:     true,
-		Mode:              routing.Server_TLSOptions_SIMPLE,
-		ServerCertificate: "server.pem",
-		PrivateKey:        "key.pem",
-	}
-	port80 = &routing.Port{
-		Number:   80,
-		Name:     "http-foo",
-		Protocol: "HTTP",
-	}
-	port80DifferentName = &routing.Port{
-		Number:   80,
-		Name:     "http-FOO",
-		Protocol: "HTTP",
-	}
-	port443 = &routing.Port{
-		Number:   443,
-		Name:     "https-foo",
-		Protocol: "HTTPS",
-	}
+	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pkg/config"
 )
 
 func TestMergeGateways(t *testing.T) {
+	gwHTTPFoo := makeConfig("foo1", "not-default", "foo.bar.com", "name1", "http", 7, "ingressgateway")
+	gwHTTP2Wildcard := makeConfig("foo5", "not-default", "*", "name5", "http2", 8, "ingressgateway")
+	gwHTTPWildcard := makeConfig("foo3", "not-default", "*", "name3", "http", 8, "ingressgateway")
+	gwTCPWildcard := makeConfig("foo4", "not-default-2", "*", "name4", "tcp", 8, "ingressgateway")
+
+	gwHTTPWildcardAlternate := makeConfig("foo2", "not-default", "*", "name2", "http", 7, "ingressgateway2")
+
 	tests := []struct {
-		name              string
-		b                 *routing.Gateway
-		a                 *routing.Gateway
-		expectedOut       *routing.Gateway
-		expectedErrPrefix error
+		name               string
+		gwConfig           []config.Config
+		serversNum         int
+		serversForRouteNum map[string]int
+		gatewaysNum        int
 	}{
-		{"idempotent",
-			&routing.Gateway{Servers: []*routing.Server{}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port443,
-					Tls:   tlsOne,
-					Hosts: []string{"example.com"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port443,
-					Tls:   tlsOne,
-					Hosts: []string{"example.com"},
-				},
-			}},
-			nil,
+		{
+			"single-server-config",
+			[]config.Config{gwHTTPFoo},
+			1,
+			map[string]int{"http.7": 1},
+			1,
 		},
-		{"different ports",
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"example.com"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port443,
-					Tls:   tlsTwo,
-					Hosts: []string{"example.com"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"example.com"},
-				}, {
-					Port:  port443,
-					Tls:   tlsTwo,
-					Hosts: []string{"example.com"},
-				}}},
-			nil,
+		{
+			"same-server-config",
+			[]config.Config{gwHTTPFoo, gwHTTPWildcardAlternate},
+			1,
+			map[string]int{"http.7": 2},
+			2,
 		},
-		{"same ports different domains (Multiple Hosts)",
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"foo.com"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"bar.com"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"bar.com", "foo.com"},
-				},
-			}},
-			nil,
+		{
+			"multi-server-config",
+			[]config.Config{gwHTTPFoo, gwHTTPWildcardAlternate, gwHTTPWildcard},
+			2,
+			map[string]int{"http.7": 2, "http.8": 1},
+			3,
 		},
-		{"different domains, different ports",
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"foo.com"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port443,
-					Tls:   tlsTwo,
-					Hosts: []string{"bar.com"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"foo.com"},
-				}, {
-					Port:  port443,
-					Tls:   tlsTwo,
-					Hosts: []string{"bar.com"},
-				}}},
-			nil,
+		{
+			"http-tcp-server-config",
+			[]config.Config{gwHTTPFoo, gwTCPWildcard},
+			2,
+			map[string]int{"http.7": 1},
+			2,
 		},
-		{"conflicting port names",
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"foo.com"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80DifferentName,
-					Tls:   tlsOne,
-					Hosts: []string{"bar.com"},
-				},
-			}},
-			nil,
-			errors.New(`unable to merge gateways: conflicting ports`),
+		{
+			"tcp-tcp-server-config",
+			[]config.Config{gwTCPWildcard, gwHTTPWildcard},
+			1,
+			map[string]int{},
+			2,
 		},
-		{"wildcard hosts",
-			&routing.Gateway{},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"*"},
-				},
-			}},
-			&routing.Gateway{Servers: []*routing.Server{
-				{
-					Port:  port80,
-					Tls:   tlsOne,
-					Hosts: []string{"*"},
-				},
-			}},
-			nil,
+		{
+			"tcp-tcp-server-config",
+			[]config.Config{gwHTTPWildcard, gwTCPWildcard}, //order matters
+			1,
+			map[string]int{"http.8": 1},
+			2,
+		},
+		{
+			"http-http2-server-config",
+			[]config.Config{gwHTTPWildcard, gwHTTP2Wildcard}, //order matters
+			1,
+			// http and http2 both present
+			map[string]int{"http.8": 2},
+			2,
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// we want to save the original state of tt.a for printing if we fail the test, so we'll merge into a new gateway struct.
-			actual := &routing.Gateway{}
-			MergeGateways(actual, tt.a) // nolint: errcheck
-			err := MergeGateways(actual, tt.b)
-			if err != tt.expectedErrPrefix && !strings.HasPrefix(err.Error(), tt.expectedErrPrefix.Error()) {
-				t.Fatalf("%s: got err %v, wanted %v", tt.name, err, tt.expectedErrPrefix)
+
+	for idx, tt := range tests {
+		t.Run(fmt.Sprintf("[%d] %s", idx, tt.name), func(t *testing.T) {
+			mgw := MergeGateways(tt.gwConfig...)
+			if len(mgw.Servers) != tt.serversNum {
+				t.Errorf("Incorrect number of servers. Expected: %v Got: %d", tt.serversNum, len(mgw.Servers))
 			}
-			if err == nil {
-				if !reflect.DeepEqual(actual, tt.expectedOut) {
-					t.Fatalf("%s: got %v, wanted %v", tt.name, actual, tt.expectedOut)
+			if len(mgw.ServersByRouteName) != len(tt.serversForRouteNum) {
+				t.Errorf("Incorrect number of routes. Expected: %v Got: %d", len(tt.serversForRouteNum), len(mgw.ServersByRouteName))
+			}
+			for k, v := range mgw.ServersByRouteName {
+				if tt.serversForRouteNum[k] != len(v) {
+					t.Errorf("for route %v expected %v servers got %v", k, tt.serversForRouteNum[k], len(v))
 				}
 			}
-		})
-	}
-}
-
-func TestPortsEqualAndDistinct(t *testing.T) {
-	tests := []struct {
-		name             string
-		b                *routing.Port
-		a                *routing.Port
-		expectedEqual    bool
-		expectedDistinct bool
-	}{
-		{"empty", &routing.Port{}, &routing.Port{}, true, false},
-		{"happy",
-			&routing.Port{Number: 1, Name: "Bill", Protocol: "HTTP"},
-			&routing.Port{Number: 1, Name: "Bill", Protocol: "HTTP"},
-			true, false},
-		{"same numbers but different names (case sensitive)",
-			&routing.Port{Number: 1, Name: "Bill", Protocol: "HTTP"},
-			&routing.Port{Number: 1, Name: "bill", Protocol: "HTTP"},
-			false, false},
-		{"case insensitive",
-			&routing.Port{Number: 1, Name: "potato", Protocol: "GRPC"},
-			&routing.Port{Number: 1, Name: "potato", Protocol: "grpc"},
-			true, false},
-		{"different numbers but same names",
-			&routing.Port{Number: 1, Name: "potato", Protocol: "tcp"},
-			&routing.Port{Number: 2, Name: "potato", Protocol: "tcp"},
-			false, false},
-		{"different protocols but same names",
-			&routing.Port{Number: 1, Name: "potato", Protocol: "http2"},
-			&routing.Port{Number: 1, Name: "potato", Protocol: "http"},
-			false, false},
-		{"different numbers and different names",
-			&routing.Port{Number: 1, Name: "potato", Protocol: "tcp"},
-			&routing.Port{Number: 2, Name: "banana", Protocol: "tcp"},
-			false, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			actualEquality := portsEqual(tt.a, tt.b)
-			if actualEquality != tt.expectedEqual {
-				t.Fatalf("%s: [%v] =?= [%v] got %t, wanted %t", tt.name, tt.a, tt.b, actualEquality, tt.expectedEqual)
-			}
-			actualDistinct := portsAreDistinct(tt.a, tt.b)
-			if actualDistinct != tt.expectedDistinct {
-				t.Fatalf("%s: [%v] =?= [%v] got %t, wanted %t", tt.name, tt.a, tt.b, actualDistinct, tt.expectedDistinct)
+			if len(mgw.GatewayNameForServer) != tt.gatewaysNum {
+				t.Errorf("Incorrect number of gateways. Expected: %v Got: %d", tt.gatewaysNum, len(mgw.GatewayNameForServer))
 			}
 		})
 	}
 }
 
-func TestTlsEqual(t *testing.T) {
+func makeConfig(name, namespace, host, portName, portProtocol string, portNumber uint32, gw string) config.Config {
+	c := config.Config{
+		Meta: config.Meta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: &networking.Gateway{
+			Selector: map[string]string{"istio": gw},
+			Servers: []*networking.Server{
+				{
+					Hosts: []string{host},
+					Port:  &networking.Port{Name: portName, Number: portNumber, Protocol: portProtocol},
+				},
+			},
+		},
+	}
+	return c
+}
+
+func TestParseGatewayRDSRouteName(t *testing.T) {
+	type args struct {
+		name string
+	}
 	tests := []struct {
-		name  string
-		b     *routing.Server_TLSOptions
-		a     *routing.Server_TLSOptions
-		equal bool
+		name           string
+		args           args
+		wantPortNumber int
+		wantPortName   string
+		wantGateway    string
 	}{
-		{"empty", &routing.Server_TLSOptions{}, &routing.Server_TLSOptions{}, true},
-		{"happy",
-			&routing.Server_TLSOptions{HttpsRedirect: true, Mode: routing.Server_TLSOptions_SIMPLE, ServerCertificate: "server.pem", PrivateKey: "key.pem"},
-			&routing.Server_TLSOptions{HttpsRedirect: true, Mode: routing.Server_TLSOptions_SIMPLE, ServerCertificate: "server.pem", PrivateKey: "key.pem"},
-			true},
-		{"different",
-			&routing.Server_TLSOptions{HttpsRedirect: true, Mode: routing.Server_TLSOptions_SIMPLE, ServerCertificate: "server.pem", PrivateKey: "key.pem"},
-			&routing.Server_TLSOptions{HttpsRedirect: false},
-			false},
+		{
+			name:           "invalid rds name",
+			args:           args{"https.scooby.dooby.doo"},
+			wantPortNumber: 0,
+			wantPortName:   "",
+			wantGateway:    "",
+		},
+		{
+			name:           "gateway http rds name",
+			args:           args{"http.80"},
+			wantPortNumber: 80,
+			wantPortName:   "",
+			wantGateway:    "",
+		},
+		{
+			name:           "https rds name",
+			args:           args{"https.443.app1.gw1.ns1"},
+			wantPortNumber: 443,
+			wantPortName:   "app1",
+			wantGateway:    "ns1/gw1",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := tlsEqual(tt.a, tt.b)
-			if actual != tt.equal {
-				t.Fatalf("tlsEqual(%v, %v) = %t, wanted %v", tt.a, tt.b, actual, tt.equal)
+			gotPortNumber, gotPortName, gotGateway := ParseGatewayRDSRouteName(tt.args.name)
+			if gotPortNumber != tt.wantPortNumber {
+				t.Errorf("ParseGatewayRDSRouteName() gotPortNumber = %v, want %v", gotPortNumber, tt.wantPortNumber)
+			}
+			if gotPortName != tt.wantPortName {
+				t.Errorf("ParseGatewayRDSRouteName() gotPortName = %v, want %v", gotPortName, tt.wantPortName)
+			}
+			if gotGateway != tt.wantGateway {
+				t.Errorf("ParseGatewayRDSRouteName() gotGateway = %v, want %v", gotGateway, tt.wantGateway)
 			}
 		})
 	}

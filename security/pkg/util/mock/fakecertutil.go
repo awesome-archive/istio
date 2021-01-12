@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,14 @@ import "time"
 
 // FakeCertUtil is a mocked CertUtil for testing.
 type FakeCertUtil struct {
-	duration time.Duration
-	err      error
+	Duration time.Duration
+	Err      error
 }
 
 // GetWaitTime returns duration if err is nil, otherwise, it returns err.
-func (f FakeCertUtil) GetWaitTime(certBytes []byte, now time.Time, gracePeriodPercentage int) (time.Duration, error) {
-	if f.err != nil {
-		return time.Duration(0), f.err
+func (f FakeCertUtil) GetWaitTime(certBytes []byte, now time.Time, minGracePeriod time.Duration) (time.Duration, error) {
+	if f.Err != nil {
+		return time.Duration(0), f.Err
 	}
-	return f.duration, nil
+	return f.Duration, nil
 }

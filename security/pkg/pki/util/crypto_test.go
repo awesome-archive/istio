@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,11 @@
 package util
 
 import (
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"reflect"
@@ -70,15 +74,15 @@ xGSDfnFvR13RCqeUdlQofVYpolqrSobOyOVfQv2ksnPPsC87NISM
 -----END RSA PRIVATE KEY-----`
 
 	keyECDSA = `
------BEGIN EC PARAMETERS-----
+-----BEGIN EC PRIVATE KEY-----
 MGgCAQEEHBMUyVWFKTW4TwtwCmIAxdpsBFn0MV7tGeSA32CgBwYFK4EEACGhPAM6
 AATCkAx7whb2k3xWm+UjlFWFiV11oYmIdYgXqiAQkiz7fEq6QFhsjjCizeGzAlhT
 TmngRSxv/dSvGA==
------END EC PARAMETERS-----`
+-----END EC PRIVATE KEY-----`
 
 	keyInvalidECDSA = `
------BEGIN EC PARAMETERS-----
------END EC PARAMETERS-----`
+-----BEGIN EC PRIVATE KEY-----
+-----END EC PRIVATE KEY-----`
 
 	keyPKCS8RSA = `
 -----BEGIN PRIVATE KEY-----
@@ -176,7 +180,7 @@ func TestParsePemEncodedCertificate(t *testing.T) {
 			if err == nil {
 				t.Errorf("%s: no error is returned", id)
 			} else if c.errMsg != err.Error() {
-				t.Errorf("%s: Unexpected error message: want %s but got %s", id, c.errMsg, err.Error())
+				t.Errorf(`%s: Unexpected error message: expected "%s" but got "%s"`, id, c.errMsg, err.Error())
 			}
 		} else if cert.PublicKeyAlgorithm != c.publicKeyAlgo {
 			t.Errorf("%s: Unexpected public key algorithm: want %d but got %d", id, c.publicKeyAlgo, cert.PublicKeyAlgorithm)
@@ -208,10 +212,12 @@ func TestParsePemEncodedCSR(t *testing.T) {
 		_, err := ParsePemEncodedCSR([]byte(c.pem))
 		if c.errMsg != "" {
 			if err == nil {
-				t.Errorf("%s: no error is returned", id)
+				t.Errorf(`%s: no error is returned, expected "%s"`, id, c.errMsg)
 			} else if c.errMsg != err.Error() {
-				t.Errorf("%s: Unexpected error message: want %s but got %s", id, c.errMsg, err.Error())
+				t.Errorf(`%s: Unexpected error message: want "%s" but got "%s"`, id, c.errMsg, err.Error())
 			}
+		} else if err != nil {
+			t.Errorf(`%s: Unexpected error: "%s"`, id, err)
 		}
 	}
 }
@@ -260,12 +266,78 @@ func TestParsePemEncodedKey(t *testing.T) {
 		key, err := ParsePemEncodedKey([]byte(c.pem))
 		if c.errMsg != "" {
 			if err == nil {
-				t.Errorf("%s: no error is returned", id)
+				t.Errorf(`%s: no error is returned, expected "%s"`, id, c.errMsg)
 			} else if c.errMsg != err.Error() {
-				t.Errorf(`%s: Unexpected error message: want "%s" but got "%s"`, id, c.errMsg, err.Error())
+				t.Errorf(`%s: Unexpected error message: expected "%s" but got "%s"`, id, c.errMsg, err.Error())
 			}
+		} else if err != nil {
+			t.Errorf(`%s: Unexpected error: "%s"`, id, err)
 		} else if keyType := reflect.TypeOf(key); keyType != c.keyType {
-			t.Errorf("%s: Unmatched key type: expected %v but got %v", id, c.keyType, keyType)
+			t.Errorf(`%s: Unmatched key type: expected "%v" but got "%v"`, id, c.keyType, keyType)
+		}
+	}
+}
+func TestGetRSAKeySize(t *testing.T) {
+	testCases := map[string]struct {
+		pem    string
+		size   int
+		errMsg string
+	}{
+		"Success with RSA key": {
+			pem:  keyRSA,
+			size: 2048,
+		},
+		"Success with PKCS8RSA key": {
+			pem:  keyPKCS8RSA,
+			size: 2048,
+		},
+		"Failure with non-RSA key": {
+			pem:    keyECDSA,
+			errMsg: "key type is not RSA: *ecdsa.PrivateKey",
+		},
+	}
+
+	for id, c := range testCases {
+		key, err := ParsePemEncodedKey([]byte(c.pem))
+		if err != nil {
+			t.Errorf("%s: failed to parse the Pem key.", id)
+		}
+		size, err := GetRSAKeySize(key)
+		if c.errMsg != "" {
+			if err == nil {
+				t.Errorf(`%s: no error is returned, expected error: "%s"`, id, c.errMsg)
+			} else if c.errMsg != err.Error() {
+				t.Errorf(`%s: Unexpected error message: expected "%s" but got "%s"`, id, c.errMsg, err.Error())
+			}
+		} else if err != nil {
+			t.Errorf(`%s: Unexpected error: "%s"`, id, err)
+		} else if size != c.size {
+			t.Errorf(`%s: Unmatched key size: expected %v but got "%v"`, id, c.size, size)
+		}
+	}
+}
+
+func TestIsSupportedECPrivateKey(t *testing.T) {
+	_, ed25519PrivKey, _ := ed25519.GenerateKey(nil)
+	ecdsaPrivKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	cases := map[string]struct {
+		key         crypto.PrivateKey
+		isSupported bool
+	}{
+		"ECDSA": {
+			key:         ecdsaPrivKey,
+			isSupported: true,
+		},
+		"ED25519": {
+			key:         ed25519PrivKey,
+			isSupported: false,
+		},
+	}
+
+	for id, tc := range cases {
+		if IsSupportedECPrivateKey(&tc.key) != tc.isSupported {
+			t.Errorf("%s: does not match expected support level for EC signature algorithms", id)
 		}
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,63 +12,248 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package aggregate_test
+package aggregate
 
 import (
+	"strings"
 	"testing"
+	"time"
 
-	"istio.io/istio/pilot/pkg/config/aggregate"
+	"github.com/onsi/gomega"
+	"go.uber.org/atomic"
+
+	"istio.io/istio/galley/pkg/config/testing/fixtures"
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/test/mock"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
-const (
-	// TestNamespace for testing
-	TestNamespace = "test"
-)
+func TestAggregateStoreBasicMake(t *testing.T) {
+	g := gomega.NewWithT(t)
 
-func TestStoreInvariant(t *testing.T) {
-	store, _ := makeCache(t)
-	mock.CheckMapInvariant(store, t, "", 10)
+	schema1 := collections.K8SServiceApisV1Alpha1Httproutes
+	schema2 := collections.K8SServiceApisV1Alpha1Gatewayclasses
+	store1 := memory.Make(collection.SchemasFor(schema1))
+	store2 := memory.Make(collection.SchemasFor(schema2))
+
+	stores := []model.ConfigStore{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	schemas := store.Schemas()
+	g.Expect(schemas.All()).To(gomega.HaveLen(2))
+	fixtures.ExpectEqual(t, schemas, collection.SchemasFor(schema1, schema2))
 }
 
-func TestStoreValidation(t *testing.T) {
-	mockStore := memory.Make(mock.Types)
-	if _, err := aggregate.Make([]model.ConfigStore{mockStore, mockStore}); err == nil {
-		t.Error("expected error in duplicate types in the config store")
+func TestAggregateStoreMakeValidationFailure(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	store1 := memory.Make(collection.SchemasFor(schemaFor("SomeConfig", "broken message name")))
+
+	stores := []model.ConfigStore{store1}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("not found: broken message name")))
+	g.Expect(store).To(gomega.BeNil())
+}
+
+func TestAggregateStoreGet(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	store1 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Gatewayclasses))
+	store2 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Gatewayclasses))
+
+	configReturn := &config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: collections.K8SServiceApisV1Alpha1Gatewayclasses.Resource().GroupVersionKind(),
+			Name:             "other",
+		},
+	}
+
+	store1.Create(*configReturn)
+
+	stores := []model.ConfigStore{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	c := store.Get(collections.K8SServiceApisV1Alpha1Gatewayclasses.Resource().GroupVersionKind(), "other", "")
+	g.Expect(c.Name).To(gomega.Equal(configReturn.Name))
+}
+
+func TestAggregateStoreList(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	store1 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+	store2 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+
+	if _, err := store1.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(),
+			Name:             "other",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store2.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(),
+			Name:             "another",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stores := []model.ConfigStore{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	l, err := store.List(collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(), "")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(l).To(gomega.HaveLen(2))
+}
+
+func TestAggregateStoreWrite(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	store1 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+	store2 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+
+	stores := []model.ConfigStore{store1, store2}
+
+	store, err := makeStore(stores, store1)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	if _, err := store.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(),
+			Name:             "other",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	la, err := store.List(collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(), "")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(la).To(gomega.HaveLen(1))
+	g.Expect(la[0].Name).To(gomega.Equal("other"))
+
+	l, err := store1.List(collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(), "")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(l).To(gomega.HaveLen(1))
+	g.Expect(l[0].Name).To(gomega.Equal("other"))
+
+	// Check the aggregated and individual store return identical response
+	g.Expect(la).To(gomega.BeEquivalentTo(l))
+
+	l, err = store2.List(collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(), "")
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(l).To(gomega.HaveLen(0))
+}
+
+func TestAggregateStoreWriteWithoutWriter(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	store1 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+	store2 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+
+	stores := []model.ConfigStore{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	if _, err := store.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(),
+			Name:             "other",
+		},
+	}); err != errorUnsupported {
+		t.Fatalf("unexpected error, want %v got %v", errorUnsupported, err)
 	}
 }
 
-func makeCache(t *testing.T) (model.ConfigStore, model.ConfigStoreCache) {
-	mockStore := memory.Make(mock.Types)
-	mockStoreCache := memory.NewController(mockStore)
-	istioStore := memory.Make(model.IstioConfigTypes)
-	istioStoreCache := memory.NewController(istioStore)
+func TestAggregateStoreFails(t *testing.T) {
+	g := gomega.NewWithT(t)
 
-	store, err := aggregate.Make([]model.ConfigStore{mockStore, istioStore})
+	store1 := memory.Make(collection.SchemasFor(schemaFor("OtherConfig", "istio.networking.v1alpha3.Gateway")))
+
+	stores := []model.ConfigStore{store1}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	t.Run("Fails to Delete", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+
+		err = store.Delete(config.GroupVersionKind{Kind: "not"}, "gonna", "work", nil)
+		g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("unsupported operation")))
+	})
+
+	t.Run("Fails to Create", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+
+		c, err := store.Create(config.Config{})
+		g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("unsupported operation")))
+		g.Expect(c).To(gomega.BeEmpty())
+	})
+
+	t.Run("Fails to Update", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+
+		c, err := store.Update(config.Config{})
+		g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("unsupported operation")))
+		g.Expect(c).To(gomega.BeEmpty())
+	})
+}
+
+func TestAggregateStoreCache(t *testing.T) {
+	stop := make(chan struct{})
+	defer func() { close(stop) }()
+
+	store1 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+	controller1 := memory.NewController(store1)
+	go controller1.Run(stop)
+
+	store2 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Gatewayclasses))
+	controller2 := memory.NewController(store2)
+	go controller2.Run(stop)
+
+	stores := []model.ConfigStoreCache{controller1, controller2}
+
+	cacheStore, err := MakeCache(stores)
 	if err != nil {
-		t.Fatalf("unexpected error %v", err)
+		t.Fatal(err)
 	}
-	ctl, err := aggregate.MakeCache([]model.ConfigStoreCache{mockStoreCache, istioStoreCache})
-	if err != nil {
-		t.Fatalf("unexpected error %v", err)
-	}
-	return store, ctl
+
+	t.Run("it registers an event handler", func(t *testing.T) {
+		handled := atomic.NewBool(false)
+		cacheStore.RegisterEventHandler(collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(), func(config.Config, config.Config, model.Event) {
+			handled.Store(true)
+		})
+
+		controller1.Create(config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(),
+				Name:             "another",
+			},
+		})
+		retry.UntilOrFail(t, handled.Load, retry.Timeout(time.Second))
+	})
 }
 
-// TODO: fix race conditions and re-enable tests.
-//func TestControllerEvents(t *testing.T) {
-//	_, ctl := makeCache(t)
-//	mock.CheckCacheEvents(ctl, ctl, TestNamespace, 5, t)
-//}
-//
-//func TestControllerCacheFreshness(t *testing.T) {
-//	_, ctl := makeCache(t)
-//	mock.CheckCacheFreshness(ctl, TestNamespace, t)
-//}
-//
-// func TestControllerClientSync(t *testing.T) {
-// 	store, ctl := makeCache(t)
-// 	mock.CheckCacheSync(store, ctl, TestNamespace, 5, t)
-// }
+func schemaFor(kind, proto string) collection.Schema {
+	return collection.Builder{
+		Name: strings.ToLower(kind),
+		Resource: resource.Builder{
+			Kind:   kind,
+			Plural: strings.ToLower(kind) + "s",
+			Proto:  proto,
+		}.BuildNoValidate(),
+	}.MustBuild()
+}
