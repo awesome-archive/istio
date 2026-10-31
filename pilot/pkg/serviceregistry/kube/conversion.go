@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,300 +16,240 @@ package kube
 
 import (
 	"fmt"
-	"sort"
-	"strconv"
 	"strings"
 
-	multierror "github.com/hashicorp/go-multierror"
-	"k8s.io/api/core/v1"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/api/annotation"
+	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/kube"
+	"istio.io/istio/pkg/config/visibility"
+	"istio.io/istio/pkg/spiffe"
+	"istio.io/istio/pkg/util/sets"
 )
 
-type kubeServiceNode struct {
-	// PodName Specifies the name of the POD
-	PodName string
-
-	// Namespace specifies the name of the namespace the pod belongs to
-	Namespace string
-
-	// Domain specifies the pod's domain
-	Domain string
-}
-
-const (
-	// IngressClassAnnotation is the annotation on ingress resources for the class of controllers
-	// responsible for it
-	IngressClassAnnotation = "kubernetes.io/ingress.class"
-
-	// KubeServiceAccountsOnVMAnnotation is to specify the K8s service accounts that are allowed to run
-	// this service on the VMs
-	KubeServiceAccountsOnVMAnnotation = "alpha.istio.io/kubernetes-serviceaccounts"
-
-	// CanonicalServiceAccountsOnVMAnnotation is to specify the non-Kubernetes service accounts that
-	// are allowed to run this service on the VMs
-	CanonicalServiceAccountsOnVMAnnotation = "alpha.istio.io/canonical-serviceaccounts"
-
-	// IstioURIPrefix is the URI prefix in the Istio service account scheme
-	IstioURIPrefix = "spiffe"
-
-	// PortAuthenticationAnnotationKeyPrefix is the annotation key prefix that used to define
-	// authentication policy.
-	PortAuthenticationAnnotationKeyPrefix = "auth.istio.io"
-)
-
-func convertLabels(obj meta_v1.ObjectMeta) model.Labels {
-	out := make(model.Labels, len(obj.Labels))
-	for k, v := range obj.Labels {
-		out[k] = v
-	}
-	return out
-}
-
-// Extracts security option for given port from annotation. If there is no such
-// annotation, or the annotation value is not recognized, returns
-// meshconfig.AuthenticationPolicy_INHERIT
-func extractAuthenticationPolicy(port v1.ServicePort, obj meta_v1.ObjectMeta) meshconfig.AuthenticationPolicy {
-	if obj.Annotations == nil {
-		return meshconfig.AuthenticationPolicy_INHERIT
-	}
-	if val, ok := meshconfig.AuthenticationPolicy_value[obj.Annotations[portAuthenticationAnnotationKey(int(port.Port))]]; ok {
-		return meshconfig.AuthenticationPolicy(val)
-	}
-	return meshconfig.AuthenticationPolicy_INHERIT
-}
-
-func convertPort(port v1.ServicePort, obj meta_v1.ObjectMeta) *model.Port {
+func convertPort(port corev1.ServicePort) *model.Port {
 	return &model.Port{
-		Name:                 port.Name,
-		Port:                 int(port.Port),
-		Protocol:             ConvertProtocol(port.Name, port.Protocol),
-		AuthenticationPolicy: extractAuthenticationPolicy(port, obj),
+		Name:       port.Name,
+		Port:       int(port.Port),
+		TargetPort: port.TargetPort,
+		Protocol:   kube.ConvertProtocol(port.Port, port.Name, port.Protocol, port.AppProtocol),
 	}
 }
 
-func convertService(svc v1.Service, domainSuffix string) *model.Service {
-	addr, external := "", ""
-	if svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != v1.ClusterIPNone {
-		addr = svc.Spec.ClusterIP
+func ConvertService(svc corev1.Service, nsAnnotations map[string]string, domainSuffix string, clusterID cluster.ID, trustDomain string) *model.Service {
+	addrs := []string{constants.UnspecifiedIP}
+	resolution := model.ClientSideLB
+	externalName := ""
+	nodeLocal := false
+
+	if svc.Spec.Type == corev1.ServiceTypeExternalName && svc.Spec.ExternalName != "" {
+		externalName = svc.Spec.ExternalName
+		resolution = model.Alias
+	}
+	if svc.Spec.InternalTrafficPolicy != nil && *svc.Spec.InternalTrafficPolicy == corev1.ServiceInternalTrafficPolicyLocal {
+		nodeLocal = true
 	}
 
-	if svc.Spec.Type == v1.ServiceTypeExternalName && svc.Spec.ExternalName != "" {
-		external = svc.Spec.ExternalName
+	if svc.Spec.ClusterIP == corev1.ClusterIPNone { // headless services should not be load balanced
+		resolution = model.Passthrough
+	} else if svc.Spec.ClusterIP != "" {
+		addrs[0] = svc.Spec.ClusterIP
+		if len(svc.Spec.ClusterIPs) > 1 {
+			addrs = svc.Spec.ClusterIPs
+		}
 	}
 
 	ports := make([]*model.Port, 0, len(svc.Spec.Ports))
 	for _, port := range svc.Spec.Ports {
-		ports = append(ports, convertPort(port, svc.ObjectMeta))
+		ports = append(ports, convertPort(port))
 	}
 
-	loadBalancingDisabled := addr == "" && external == "" // headless services should not be load balanced
-
+	var exportTo sets.Set[visibility.Instance]
 	serviceaccounts := make([]string, 0)
-	if svc.Annotations != nil {
-		if svc.Annotations[CanonicalServiceAccountsOnVMAnnotation] != "" {
-			for _, csa := range strings.Split(svc.Annotations[CanonicalServiceAccountsOnVMAnnotation], ",") {
-				serviceaccounts = append(serviceaccounts, canonicalToIstioServiceAccount(csa))
-			}
+	if svc.Annotations[annotation.AlphaCanonicalServiceAccounts.Name] != "" {
+		serviceaccounts = append(serviceaccounts, strings.Split(svc.Annotations[annotation.AlphaCanonicalServiceAccounts.Name], ",")...)
+	}
+	if svc.Annotations[annotation.AlphaKubernetesServiceAccounts.Name] != "" {
+		for _, ksa := range strings.Split(svc.Annotations[annotation.AlphaKubernetesServiceAccounts.Name], ",") {
+			serviceaccounts = append(serviceaccounts, kubeToIstioServiceAccount(ksa, svc.Namespace, trustDomain))
 		}
-		if svc.Annotations[KubeServiceAccountsOnVMAnnotation] != "" {
-			for _, ksa := range strings.Split(svc.Annotations[KubeServiceAccountsOnVMAnnotation], ",") {
-				serviceaccounts = append(serviceaccounts, kubeToIstioServiceAccount(ksa, svc.Namespace, domainSuffix))
+	}
+	if svc.Annotations[annotation.NetworkingExportTo.Name] != "" {
+		namespaces := strings.Split(svc.Annotations[annotation.NetworkingExportTo.Name], ",")
+		exportTo = sets.NewWithLength[visibility.Instance](len(namespaces))
+		for _, ns := range namespaces {
+			ns = strings.TrimSpace(ns)
+			exportTo.Insert(visibility.Instance(ns))
+		}
+	}
+
+	istioService := &model.Service{
+		Hostname: ServiceHostname(svc.Name, svc.Namespace, domainSuffix),
+		ClusterVIPs: model.AddressMap{
+			Addresses: map[cluster.ID][]string{
+				clusterID: addrs,
+			},
+		},
+		Ports:           ports,
+		DefaultAddress:  addrs[0],
+		ServiceAccounts: serviceaccounts,
+		MeshExternal:    len(externalName) > 0,
+		Resolution:      resolution,
+		CreationTime:    svc.CreationTimestamp.Time,
+		ResourceVersion: svc.ResourceVersion,
+		Attributes: model.ServiceAttributes{
+			ServiceRegistry: provider.Kubernetes,
+			Name:            svc.Name,
+			Namespace:       svc.Namespace,
+			Labels:          svc.Labels,
+			ExportTo:        exportTo,
+			LabelSelectors:  svc.Spec.Selector,
+		},
+	}
+
+	switch svc.Spec.Type {
+	case corev1.ServiceTypeNodePort:
+		if _, ok := svc.Annotations[annotation.TrafficNodeSelector.Name]; !ok {
+			// only do this for istio ingress-gateway services
+			break
+		}
+		// store the service port to node port mappings
+		portMap := make(map[uint32]uint32)
+		for _, p := range svc.Spec.Ports {
+			portMap[uint32(p.Port)] = uint32(p.NodePort)
+		}
+		istioService.Attributes.ClusterExternalPorts = map[cluster.ID]map[uint32]uint32{clusterID: portMap}
+		// address mappings will be done elsewhere
+	case corev1.ServiceTypeLoadBalancer:
+		if len(svc.Status.LoadBalancer.Ingress) > 0 {
+			var lbAddrs []string
+			for _, ingress := range svc.Status.LoadBalancer.Ingress {
+				if len(ingress.IP) > 0 {
+					lbAddrs = append(lbAddrs, ingress.IP)
+				} else if len(ingress.Hostname) > 0 {
+					// DO NOT resolve the DNS here. In environments like AWS, the ELB hostname
+					// does not have a repeatable DNS address and IPs resolved at an earlier point
+					// in time may not work. So, when we get just hostnames instead of IPs, we need
+					// to smartly switch from EDS to strict_dns rather than doing the naive thing of
+					// resolving the DNS name and hoping the resolution is one-time task.
+					lbAddrs = append(lbAddrs, ingress.Hostname)
+				}
+			}
+			if len(lbAddrs) > 0 {
+				istioService.Attributes.ClusterExternalAddresses.SetAddressesFor(clusterID, lbAddrs)
 			}
 		}
 	}
-	sort.Sort(sort.StringSlice(serviceaccounts))
 
-	return &model.Service{
-		Hostname:              serviceHostname(svc.Name, svc.Namespace, domainSuffix),
-		Ports:                 ports,
-		Address:               addr,
-		ExternalName:          external,
-		ServiceAccounts:       serviceaccounts,
-		LoadBalancingDisabled: loadBalancingDisabled,
+	istioService.Attributes.Type = string(svc.Spec.Type)
+	istioService.Attributes.ExternalName = externalName
+	istioService.Attributes.TrafficDistribution = model.GetTrafficDistribution(svc.Spec.TrafficDistribution, svc.Annotations, nsAnnotations)
+	istioService.Attributes.NodeLocal = nodeLocal
+	istioService.Attributes.PublishNotReadyAddresses = svc.Spec.PublishNotReadyAddresses
+	if len(svc.Spec.ExternalIPs) > 0 {
+		istioService.Attributes.ClusterExternalAddresses.AddAddressesFor(clusterID, svc.Spec.ExternalIPs)
 	}
+
+	return istioService
 }
 
-// serviceHostname produces FQDN for a k8s service
-func serviceHostname(name, namespace, domainSuffix string) string {
-	return fmt.Sprintf("%s.%s.svc.%s", name, namespace, domainSuffix)
+// ServiceHostname produces FQDN for a k8s service
+func ServiceHostname(name, namespace, domainSuffix string) host.Name {
+	return host.Name(name + "." + namespace + "." + "svc" + "." + domainSuffix) // Format: "%s.%s.svc.%s"
 }
 
-// canonicalToIstioServiceAccount converts a Canonical service account to an Istio service account
-func canonicalToIstioServiceAccount(saname string) string {
-	return fmt.Sprintf("%v://%v", IstioURIPrefix, saname)
-}
-
-func portAuthenticationAnnotationKey(port int) string {
-	return fmt.Sprintf("%s/%d", PortAuthenticationAnnotationKeyPrefix, port)
+// ServiceHostnameForKR calls ServiceHostname with the name and namespace of the given kubernetes resource.
+func ServiceHostnameForKR(obj metav1.Object, domainSuffix string) host.Name {
+	return ServiceHostname(obj.GetName(), obj.GetNamespace(), domainSuffix)
 }
 
 // kubeToIstioServiceAccount converts a K8s service account to an Istio service account
-func kubeToIstioServiceAccount(saname string, ns string, domain string) string {
-	return fmt.Sprintf("%v://%v/ns/%v/sa/%v", IstioURIPrefix, domain, ns, saname)
+func kubeToIstioServiceAccount(saname string, ns string, trustDomain string) string {
+	return spiffe.MustGenSpiffeURIForTrustDomain(trustDomain, ns, saname)
 }
 
-// KeyFunc is the internal API key function that returns "namespace"/"name" or
-// "name" if "namespace" is empty
-func KeyFunc(name, namespace string) string {
-	if len(namespace) == 0 {
+// SecureNamingSAN creates the secure naming used for SAN verification from pod metadata
+func SecureNamingSAN(pod *corev1.Pod, trustDomain string) string {
+	return spiffe.MustGenSpiffeURIForTrustDomain(trustDomain, pod.Namespace, pod.Spec.ServiceAccountName)
+}
+
+// PodTLSMode returns the tls mode associated with the pod if pod has been injected with sidecar
+func PodTLSMode(pod *corev1.Pod) string {
+	if pod == nil {
+		return model.DisabledTLSModeLabel
+	}
+	return model.GetTLSModeFromEndpointLabels(pod.Labels)
+}
+
+// IsAutoPassthrough determines if a listener should use auto passthrough mode. This is used for
+// multi-network. In the Istio API, this is an explicit tls.Mode. However, this mode is not part of
+// the gateway-api, and leaks implementation details. We already have an API to declare a Gateway as
+// a multi-network gateway, so we will use this as a signal.
+// A user who wishes to expose multi-network connectivity should create a listener named "tls-passthrough"
+// with TLS.Mode Passthrough.
+// For some backwards compatibility, we assume any listener with TLS specified and a port matching
+// 15443 (or the label-override for gateway port) is auto-passthrough as well.
+func IsAutoPassthrough(gwLabels map[string]string, l v1.Listener) bool {
+	if l.TLS == nil {
+		return false
+	}
+	if hasListenerMode(l, constants.ListenerModeAutoPassthrough) {
+		return true
+	}
+	_, networkSet := gwLabels[label.TopologyNetwork.Name]
+	if !networkSet {
+		return false
+	}
+	expectedPort := "15443"
+	if port, f := gwLabels[label.NetworkingGatewayPort.Name]; f {
+		expectedPort = port
+	}
+	return fmt.Sprint(l.Port) == expectedPort
+}
+
+func hasListenerMode(l v1.Listener, mode string) bool {
+	// TODO if we add a hybrid mode for detecting HBONE/passthrough, also check that here
+	return l.TLS != nil && l.TLS.Options != nil && string(l.TLS.Options[constants.ListenerModeOption]) == mode
+}
+
+func IsAutoPassthroughSet(gwLabels map[string]string, l v1.ListenerEntry) bool {
+	if l.TLS == nil {
+		return false
+	}
+	if hasListenerModeSet(l, constants.ListenerModeAutoPassthrough) {
+		return true
+	}
+	_, networkSet := gwLabels[label.TopologyNetwork.Name]
+	if !networkSet {
+		return false
+	}
+	expectedPort := "15443"
+	if port, f := gwLabels[label.NetworkingGatewayPort.Name]; f {
+		expectedPort = port
+	}
+	return fmt.Sprint(l.Port) == expectedPort
+}
+
+func hasListenerModeSet(l v1.ListenerEntry, mode string) bool {
+	// TODO if we add a hybrid mode for detecting HBONE/passthrough, also check that here
+	return l.TLS != nil && l.TLS.Options != nil && string(l.TLS.Options[constants.ListenerModeOption]) == mode
+}
+
+func GatewaySA(gw *v1.Gateway) string {
+	name := model.GetOrDefault(gw.GetAnnotations()[annotation.GatewayServiceAccount.Name], "")
+	if name != "" {
 		return name
 	}
-	return namespace + "/" + name
-}
-
-// parseHostname extracts service name and namespace from the service hostname
-func parseHostname(hostname string) (name string, namespace string, err error) {
-	parts := strings.Split(hostname, ".")
-	if len(parts) < 2 {
-		err = fmt.Errorf("missing service name and namespace from the service hostname %q", hostname)
-		return
+	if gw.Spec.GatewayClassName == constants.RemoteGatewayClassName {
+		return fmt.Sprintf("%s-%s", gw.Name, gw.Spec.GatewayClassName)
 	}
-	name = parts[0]
-	namespace = parts[1]
-	return
-}
-
-// parsePodID extracts POD name and namespace from the service node ID
-func parsePodID(nodeID string) (podname string, namespace string, err error) {
-	parts := strings.Split(nodeID, ".")
-	if len(parts) != 2 {
-		err = fmt.Errorf("invalid ID %q. Should be <pod name>.<namespace>", nodeID)
-		return
-	}
-	podname = parts[0]
-	namespace = parts[1]
-	return
-}
-
-// parseDomain extracts the service node's domain
-func parseDomain(nodeDomain string) (namespace string, err error) {
-	parts := strings.Split(nodeDomain, ".")
-	if len(parts) != 4 {
-		err = fmt.Errorf("invalid node domain format %q. Should be <namespace>.svc.cluster.local", nodeDomain)
-		return
-	}
-	if parts[1] != "svc" || parts[2] != "cluster" || parts[3] != "local" {
-		err = fmt.Errorf("invalid node domain %q. Should be <namespace>.svc.cluster.local", nodeDomain)
-		return
-	}
-	namespace = parts[0]
-	return
-}
-
-func parseKubeServiceNode(IPAddress string, node *model.Proxy, kubeNodes map[string]*kubeServiceNode) (err error) {
-	podname, namespace, err := parsePodID(node.ID)
-	if err != nil {
-		return
-	}
-	namespace1, err := parseDomain(node.Domain)
-	if err != nil {
-		return
-	}
-	if namespace != namespace1 {
-		err = fmt.Errorf("namespace in ID %q must be equal to that in domain %q", node.ID, node.Domain)
-	}
-	kubeNodes[IPAddress] = &kubeServiceNode{
-		PodName:   podname,
-		Namespace: namespace,
-		Domain:    node.Domain}
-	return
-}
-
-// ConvertProtocol from k8s protocol and port name
-func ConvertProtocol(name string, proto v1.Protocol) model.Protocol {
-	out := model.ProtocolTCP
-	switch proto {
-	case v1.ProtocolUDP:
-		out = model.ProtocolUDP
-	case v1.ProtocolTCP:
-		prefix := name
-		i := strings.Index(name, "-")
-		if i >= 0 {
-			prefix = name[:i]
-		}
-		protocol := model.ConvertCaseInsensitiveStringToProtocol(prefix)
-		if protocol != model.ProtocolUDP && protocol != model.ProtocolUnsupported {
-			out = protocol
-		}
-	}
-	return out
-}
-
-func convertProbePort(c v1.Container, handler *v1.Handler) (*model.Port, error) {
-	if handler == nil {
-		return nil, nil
-	}
-
-	var protocol model.Protocol
-	var portVal intstr.IntOrString
-	var port int
-
-	// Only one type of handler is allowed by Kubernetes (HTTPGet or TCPSocket)
-	if handler.HTTPGet != nil {
-		portVal = handler.HTTPGet.Port
-		protocol = model.ProtocolHTTP
-	} else if handler.TCPSocket != nil {
-		portVal = handler.TCPSocket.Port
-		protocol = model.ProtocolTCP
-	} else {
-		return nil, nil
-	}
-
-	switch portVal.Type {
-	case intstr.Int:
-		port = portVal.IntValue()
-		return &model.Port{
-			Name:     "mgmt-" + strconv.Itoa(port),
-			Port:     port,
-			Protocol: protocol,
-		}, nil
-	case intstr.String:
-		for _, named := range c.Ports {
-			if named.Name == portVal.String() {
-				port = int(named.ContainerPort)
-				return &model.Port{
-					Name:     "mgmt-" + strconv.Itoa(port),
-					Port:     port,
-					Protocol: protocol,
-				}, nil
-			}
-		}
-		return nil, fmt.Errorf("missing named port %q", portVal)
-	default:
-		return nil, fmt.Errorf("incorrect port type %q", portVal)
-	}
-}
-
-// convertProbesToPorts returns a PortList consisting of the ports where the
-// pod is configured to do Liveness and Readiness probes
-func convertProbesToPorts(t *v1.PodSpec) (model.PortList, error) {
-	set := make(map[string]*model.Port)
-	var errs error
-	for _, container := range t.Containers {
-		for _, probe := range []*v1.Probe{container.LivenessProbe, container.ReadinessProbe} {
-			if probe == nil {
-				continue
-			}
-
-			p, err := convertProbePort(container, &probe.Handler)
-			if err != nil {
-				errs = multierror.Append(errs, err)
-			} else if p != nil && set[p.Name] == nil {
-				// Deduplicate along the way. We don't differentiate between HTTP vs TCP mgmt ports
-				set[p.Name] = p
-			}
-		}
-	}
-
-	mgmtPorts := make(model.PortList, 0, len(set))
-	for _, p := range set {
-		mgmtPorts = append(mgmtPorts, p)
-	}
-	sort.Slice(mgmtPorts, func(i, j int) bool { return mgmtPorts[i].Port < mgmtPorts[j].Port })
-
-	return mgmtPorts, errs
+	return gw.Name
 }

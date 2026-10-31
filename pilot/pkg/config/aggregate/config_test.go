@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,63 +12,262 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package aggregate_test
+package aggregate
 
 import (
+	"strings"
 	"testing"
+	"time"
 
-	"istio.io/istio/pilot/pkg/config/aggregate"
+	"github.com/google/go-cmp/cmp"
+	. "github.com/onsi/gomega"
+	"go.uber.org/atomic"
+
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/test/mock"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
-const (
-	// TestNamespace for testing
-	TestNamespace = "test"
-)
+func TestAggregateStoreBasicMake(t *testing.T) {
+	g := NewWithT(t)
 
-func TestStoreInvariant(t *testing.T) {
-	store, _ := makeCache(t)
-	mock.CheckMapInvariant(store, t, "", 10)
+	schema1 := collections.HTTPRoute
+	schema2 := collections.GatewayClass
+	store1 := memory.NewController(collection.SchemasFor(schema1), false)
+	store2 := memory.NewController(collection.SchemasFor(schema2), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
+
+	stores := []model.ConfigStoreController{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	schemas := store.Schemas()
+	g.Expect(cmp.Diff(schemas, collection.SchemasFor(schema1, schema2))).To(BeEmpty())
 }
 
-func TestStoreValidation(t *testing.T) {
-	mockStore := memory.Make(mock.Types)
-	if _, err := aggregate.Make([]model.ConfigStore{mockStore, mockStore}); err == nil {
-		t.Error("expected error in duplicate types in the config store")
+func TestAggregateStoreMakeValidationFailure(t *testing.T) {
+	g := NewWithT(t)
+
+	store1 := memory.NewController(collection.SchemasFor(schemaFor("SomeConfig", "broken message name")), false)
+	go store1.Run(test.NewStop(t))
+
+	stores := []model.ConfigStoreController{store1}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).To(MatchError(ContainSubstring("not found: broken message name")))
+	g.Expect(store).To(BeNil())
+}
+
+func TestAggregateStoreGet(t *testing.T) {
+	g := NewWithT(t)
+
+	store1 := memory.NewController(collection.SchemasFor(collections.GatewayClass), false)
+	store2 := memory.NewController(collection.SchemasFor(collections.GatewayClass), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
+
+	configReturn := &config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.GatewayClass,
+			Name:             "other",
+		},
+	}
+
+	_, err := store1.Create(*configReturn)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	stores := []model.ConfigStoreController{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	c := store.Get(gvk.GatewayClass, "other", "")
+	g.Expect(c.Name).To(Equal(configReturn.Name))
+}
+
+func TestAggregateStoreList(t *testing.T) {
+	g := NewWithT(t)
+
+	store1 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	store2 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
+
+	if _, err := store1.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.HTTPRoute,
+			Name:             "other",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store2.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.HTTPRoute,
+			Name:             "another",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stores := []model.ConfigStoreController{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	l := store.List(gvk.HTTPRoute, "")
+	g.Expect(l).To(HaveLen(2))
+}
+
+func TestAggregateStoreWrite(t *testing.T) {
+	g := NewWithT(t)
+
+	store1 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	store2 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
+
+	stores := []model.ConfigStoreController{store1, store2}
+
+	store, err := makeStore(stores, store1)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	if _, err := store.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.HTTPRoute,
+			Name:             "other",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	la := store.List(gvk.HTTPRoute, "")
+	g.Expect(la).To(HaveLen(1))
+	g.Expect(la[0].Name).To(Equal("other"))
+
+	l := store1.List(gvk.HTTPRoute, "")
+	g.Expect(l).To(HaveLen(1))
+	g.Expect(l[0].Name).To(Equal("other"))
+
+	// Check the aggregated and individual store return identical response
+	g.Expect(la).To(BeEquivalentTo(l))
+
+	l = store2.List(gvk.HTTPRoute, "")
+	g.Expect(l).To(HaveLen(0))
+}
+
+func TestAggregateStoreWriteWithoutWriter(t *testing.T) {
+	g := NewWithT(t)
+
+	store1 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	store2 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
+
+	stores := []model.ConfigStoreController{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	if _, err := store.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.HTTPRoute,
+			Name:             "other",
+		},
+	}); err != errorUnsupported {
+		t.Fatalf("unexpected error, want %v got %v", errorUnsupported, err)
 	}
 }
 
-func makeCache(t *testing.T) (model.ConfigStore, model.ConfigStoreCache) {
-	mockStore := memory.Make(mock.Types)
-	mockStoreCache := memory.NewController(mockStore)
-	istioStore := memory.Make(model.IstioConfigTypes)
-	istioStoreCache := memory.NewController(istioStore)
+func TestAggregateStoreFails(t *testing.T) {
+	g := NewWithT(t)
 
-	store, err := aggregate.Make([]model.ConfigStore{mockStore, istioStore})
+	store1 := memory.NewController(collection.SchemasFor(schemaFor("OtherConfig", "istio.networking.v1alpha3.Gateway")), false)
+	go store1.Run(test.NewStop(t))
+
+	stores := []model.ConfigStoreController{store1}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	t.Run("Fails to Delete", func(t *testing.T) {
+		g := NewWithT(t)
+
+		err = store.Delete(config.GroupVersionKind{Kind: "not"}, "gonna", "work", nil)
+		g.Expect(err).To(MatchError(ContainSubstring("unsupported operation")))
+	})
+
+	t.Run("Fails to Create", func(t *testing.T) {
+		g := NewWithT(t)
+
+		c, err := store.Create(config.Config{})
+		g.Expect(err).To(MatchError(ContainSubstring("unsupported operation")))
+		g.Expect(c).To(BeEmpty())
+	})
+
+	t.Run("Fails to Update", func(t *testing.T) {
+		g := NewWithT(t)
+
+		c, err := store.Update(config.Config{})
+		g.Expect(err).To(MatchError(ContainSubstring("unsupported operation")))
+		g.Expect(c).To(BeEmpty())
+	})
+}
+
+func TestAggregateStoreCache(t *testing.T) {
+	stop := make(chan struct{})
+	defer func() { close(stop) }()
+
+	controller1 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	go controller1.Run(stop)
+
+	controller2 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	go controller2.Run(stop)
+
+	stores := []model.ConfigStoreController{controller1, controller2}
+
+	cacheStore, err := MakeCache(stores)
 	if err != nil {
-		t.Fatalf("unexpected error %v", err)
+		t.Fatal(err)
 	}
-	ctl, err := aggregate.MakeCache([]model.ConfigStoreCache{mockStoreCache, istioStoreCache})
-	if err != nil {
-		t.Fatalf("unexpected error %v", err)
-	}
-	return store, ctl
+
+	t.Run("it registers an event handler", func(t *testing.T) {
+		handled := atomic.NewBool(false)
+		cacheStore.RegisterEventHandler(gvk.HTTPRoute, func(config.Config, config.Config, model.Event) {
+			handled.Store(true)
+		})
+
+		_, err := controller1.Create(config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: gvk.HTTPRoute,
+				Name:             "another",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		retry.UntilOrFail(t, handled.Load, retry.Timeout(time.Second))
+	})
 }
 
-// TODO: fix race conditions and re-enable tests.
-//func TestControllerEvents(t *testing.T) {
-//	_, ctl := makeCache(t)
-//	mock.CheckCacheEvents(ctl, ctl, TestNamespace, 5, t)
-//}
-//
-//func TestControllerCacheFreshness(t *testing.T) {
-//	_, ctl := makeCache(t)
-//	mock.CheckCacheFreshness(ctl, TestNamespace, t)
-//}
-//
-// func TestControllerClientSync(t *testing.T) {
-// 	store, ctl := makeCache(t)
-// 	mock.CheckCacheSync(store, ctl, TestNamespace, 5, t)
-// }
+func schemaFor(kind, proto string) resource.Schema {
+	return resource.Builder{
+		Kind:   kind,
+		Plural: strings.ToLower(kind) + "s",
+		Proto:  proto,
+	}.BuildNoValidate()
+}

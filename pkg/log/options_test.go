@@ -24,344 +24,215 @@ import (
 )
 
 func TestOpts(t *testing.T) {
+	resetGlobals()
+
 	cases := []struct {
 		cmdLine string
 		result  Options
 	}{
 		{"--log_as_json", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			JSONEncoding:       true,
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
+			JSONEncoding:        true,
 		}},
 
 		{"--log_target stdout --log_target stderr", Options{
-			OutputPaths:        []string{"stdout", "stderr"},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{"stdout", "stderr"},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
 		}},
 
-		{"--log_callers", Options{
-			OutputPaths:                 []string{defaultOutputPath},
-			ErrorOutputPaths:            []string{defaultErrorOutputPath},
-			outputLevel:                 string(defaultOutputLevel),
-			stackTraceLevel:             string(defaultStackTraceLevel),
-			IncludeCallerSourceLocation: true,
-			RotationMaxAge:              defaultRotationMaxAge,
-			RotationMaxSize:             defaultRotationMaxSize,
-			RotationMaxBackups:          defaultRotationMaxBackups,
-			LogGrpc:                     true,
+		{"--log_caller default", Options{
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
+			logCallers:          DefaultScopeName,
 		}},
 
 		{"--log_stacktrace_level debug", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(DebugLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    levelToString[DebugLevel],
+		}},
+
+		{"--log_stacktrace_level default:debug", Options{
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[DebugLevel],
 		}},
 
 		{"--log_stacktrace_level info", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(InfoLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    levelToString[InfoLevel],
+		}},
+
+		{"--log_stacktrace_level default:info", Options{
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[InfoLevel],
 		}},
 
 		{"--log_stacktrace_level warn", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(WarnLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    levelToString[WarnLevel],
+		}},
+
+		{"--log_stacktrace_level default:warn", Options{
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[WarnLevel],
 		}},
 
 		{"--log_stacktrace_level error", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(ErrorLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    levelToString[ErrorLevel],
+		}},
+
+		{"--log_stacktrace_level default:error", Options{
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[ErrorLevel],
 		}},
 
 		{"--log_stacktrace_level none", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(NoneLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    levelToString[NoneLevel],
+		}},
+
+		{"--log_stacktrace_level default:none", Options{
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			stackTraceLevels:    "default:none",
 		}},
 
 		{"--log_output_level debug", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(DebugLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			outputLevels:        levelToString[DebugLevel],
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
 		}},
 
 		{"--log_output_level info", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(InfoLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			outputLevels:        levelToString[InfoLevel],
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
 		}},
 
 		{"--log_output_level warn", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(WarnLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			outputLevels:        levelToString[WarnLevel],
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
 		}},
 
 		{"--log_output_level error", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(ErrorLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			outputLevels:        levelToString[ErrorLevel],
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
 		}},
 
 		{"--log_output_level none", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(NoneLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
-		}},
-
-		{"--log_rotate foobar", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotateOutputPath:   "foobar",
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
-		}},
-
-		{"--log_rotate_max_age 1234", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     1234,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
-		}},
-
-		{"--log_rotate_max_size 1234", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    1234,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
-		}},
-
-		{"--log_rotate_max_backups 1234", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: 1234,
-			LogGrpc:            true,
-		}},
-
-		// legacy, has no effect
-		{"--v 2", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
-		}},
-
-		// legacy, has no effect
-		{"-v 2", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
-		}},
-
-		// legacy, has no effect
-		{"--stderrthreshold 2", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
-		}},
-
-		// legacy, has no effect
-		{"--logtostderr", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
-		}},
-
-		// legacy, has no effect
-		{"--alsologtostderr", Options{
-			OutputPaths:        []string{defaultOutputPath},
-			ErrorOutputPaths:   []string{defaultErrorOutputPath},
-			outputLevel:        string(defaultOutputLevel),
-			stackTraceLevel:    string(defaultStackTraceLevel),
-			RotationMaxAge:     defaultRotationMaxAge,
-			RotationMaxSize:    defaultRotationMaxSize,
-			RotationMaxBackups: defaultRotationMaxBackups,
-			LogGrpc:            true,
+			OutputPaths:         []string{defaultOutputPath},
+			ErrorOutputPaths:    []string{defaultErrorOutputPath},
+			defaultOutputLevels: "default:info,grpc:none",
+			outputLevels:        levelToString[NoneLevel],
+			stackTraceLevels:    DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
 		}},
 	}
 
-	for i, c := range cases {
-		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			o := NewOptions()
-			cmd := &cobra.Command{}
-			o.AttachCobraFlags(cmd)
-			cmd.SetArgs(strings.Split(c.cmdLine, " "))
+	for j := 0; j < 2; j++ {
+		for i, c := range cases {
+			t.Run(strconv.Itoa(j*100+i), func(t *testing.T) {
+				o := DefaultOptions()
+				cmd := &cobra.Command{}
+				o.AttachCobraFlags(cmd)
+				cmd.SetArgs(strings.Split(c.cmdLine, " "))
 
-			if err := cmd.Execute(); err != nil {
-				t.Errorf("Got %v, expecting success", err)
-			}
+				if err := cmd.Execute(); err != nil {
+					t.Errorf("Got %v, expecting success", err)
+				}
 
-			if !reflect.DeepEqual(c.result, *o) {
-				t.Errorf("Got %v, expected %v", *o, c.result)
-			}
-		})
+				if !reflect.DeepEqual(c.result, *o) {
+					t.Errorf("Got %v, expected %v", *o, c.result)
+				}
+			})
+		}
+
+		_ = RegisterScope("foo", "bar")
 	}
 }
 
-func TestLevel(t *testing.T) {
+func TestSetDefaultLevel(t *testing.T) {
+	resetGlobals()
+
+	_ = RegisterScope("TestSetLevel", "")
+
 	cases := []struct {
-		outputLevel     Level
-		stackTraceLevel Level
-		fail            bool
+		flagLevels    string
+		scope         string
+		defaultLevel  Level
+		expectedLevel Level
 	}{
-		{DebugLevel, InfoLevel, false},
-		{InfoLevel, WarnLevel, false},
-		{WarnLevel, ErrorLevel, false},
-		{ErrorLevel, NoneLevel, false},
-		{NoneLevel, DebugLevel, false},
-		{"bad", "bad", true},
+		{"debug", "default", DebugLevel, DebugLevel},
+		{"default:debug", "default", DebugLevel, DebugLevel},
+		{"info", "default", DebugLevel, InfoLevel},
+		{"default:info", "default", DebugLevel, InfoLevel},
+		{"warn", "default", DebugLevel, WarnLevel},
+		{"default:warn", "default", DebugLevel, WarnLevel},
+		{"error", "default", DebugLevel, ErrorLevel},
+		{"default:error", "default", DebugLevel, ErrorLevel},
+		{"none", "default", DebugLevel, NoneLevel},
+		{"default:none", "default", DebugLevel, NoneLevel},
+
+		{"debug", "default", ErrorLevel, DebugLevel},
+		{"default:debug", "default", ErrorLevel, DebugLevel},
+		{"info", "default", ErrorLevel, InfoLevel},
+		{"default:info", "default", ErrorLevel, InfoLevel},
+		{"warn", "default", ErrorLevel, WarnLevel},
+		{"default:warn", "default", ErrorLevel, WarnLevel},
+		{"error", "default", ErrorLevel, ErrorLevel},
+		{"default:error", "default", ErrorLevel, ErrorLevel},
+		{"none", "default", ErrorLevel, NoneLevel},
+		{"default:none", "default", ErrorLevel, NoneLevel},
 	}
 
 	for i, c := range cases {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
-			o := NewOptions()
+			o := DefaultOptions()
+			o.outputLevels = c.flagLevels
+			o.stackTraceLevels = c.flagLevels
 
-			oldLevel, _ := o.GetOutputLevel()
-			err := o.SetOutputLevel(c.outputLevel)
-			newLevel, _ := o.GetOutputLevel()
-
-			checkSetLevel(t, oldLevel, c.outputLevel, newLevel, err, c.fail)
-
-			oldLevel, _ = o.GetStackTraceLevel()
-			err = o.SetStackTraceLevel(c.stackTraceLevel)
-			newLevel, _ = o.GetStackTraceLevel()
-
-			checkSetLevel(t, oldLevel, c.stackTraceLevel, newLevel, err, c.fail)
+			o.SetDefaultOutputLevel(c.scope, c.defaultLevel)
+			if err := Configure(o); err != nil {
+				t.Fatal(err)
+			}
+			if got := FindScope(c.scope).GetOutputLevel(); got != c.expectedLevel {
+				t.Fatalf("got %v want %v", got, c.expectedLevel)
+			}
 		})
-	}
-
-	// Now test setting the underlying field directly. This simulates what would
-	// happen if an invalid CLI flag was provided.
-	o := NewOptions()
-	o.outputLevel = "foobar"
-	_, err := o.GetOutputLevel()
-	if err == nil {
-		t.Errorf("Got nil, expecting error")
-	}
-
-	o = NewOptions()
-	o.stackTraceLevel = "foobar"
-	_, err = o.GetStackTraceLevel()
-	if err == nil {
-		t.Errorf("Got nil, expecting error")
-	}
-}
-
-func checkSetLevel(t *testing.T, oldLevel Level, requestedLevel Level, newLevel Level, err error, expectError bool) {
-	if expectError { // Expecting Error
-		if err == nil {
-			t.Errorf("Got success, expecting failure")
-		}
-
-		if newLevel != oldLevel {
-			t.Errorf("Got %v, expecting %v", newLevel, oldLevel)
-		}
-	} else { // Expecting success
-		if err != nil {
-			t.Errorf("Got failure '%v', expecting success", err)
-		}
-
-		if newLevel != requestedLevel {
-			t.Errorf("Got %v, expecting %v", newLevel, requestedLevel)
-		}
 	}
 }

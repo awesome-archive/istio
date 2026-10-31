@@ -16,35 +16,65 @@ package log
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"go.uber.org/zap/zapcore"
 )
 
 const (
-	defaultOutputLevel        = InfoLevel
-	defaultStackTraceLevel    = NoneLevel
-	defaultOutputPath         = "stdout"
-	defaultErrorOutputPath    = "stderr"
-	defaultRotationMaxAge     = 30
-	defaultRotationMaxSize    = 100 * 1024 * 1024
-	defaultRotationMaxBackups = 1000
+	DefaultScopeName       = "default"
+	OverrideScopeName      = "all"
+	defaultOutputLevel     = InfoLevel
+	defaultStackTraceLevel = NoneLevel
+	defaultOutputPath      = "stdout"
+	defaultErrorOutputPath = "stderr"
 )
 
 // Level is an enumeration of all supported log levels.
-type Level string
+type Level int
 
 const (
-	// DebugLevel enables debug level logging
-	DebugLevel Level = "debug"
-	// InfoLevel enables info level logging
-	InfoLevel Level = "info"
-	// WarnLevel enables warn level logging
-	WarnLevel Level = "warn"
-	// ErrorLevel enables error level logging
-	ErrorLevel Level = "error"
 	// NoneLevel disables logging
-	NoneLevel Level = "none"
+	NoneLevel Level = iota
+	// FatalLevel enables fatal level logging
+	FatalLevel
+	// ErrorLevel enables error level logging
+	ErrorLevel
+	// WarnLevel enables warn level logging
+	WarnLevel
+	// InfoLevel enables info level logging
+	InfoLevel
+	// DebugLevel enables debug level logging
+	DebugLevel
 )
+
+var levelToString = map[Level]string{
+	DebugLevel: "debug",
+	InfoLevel:  "info",
+	WarnLevel:  "warn",
+	ErrorLevel: "error",
+	FatalLevel: "fatal",
+	NoneLevel:  "none",
+}
+
+var stringToLevel = map[string]Level{
+	"debug": DebugLevel,
+	"info":  InfoLevel,
+	"warn":  WarnLevel,
+	"error": ErrorLevel,
+	"fatal": FatalLevel,
+	"none":  NoneLevel,
+}
+
+func StringToLevel(level string) Level {
+	return stringToLevel[level]
+}
+
+func LevelToString(level Level) string {
+	return levelToString[level]
+}
 
 // Options defines the set of options supported by Istio's component logging package.
 type Options struct {
@@ -58,104 +88,118 @@ type Options struct {
 	// standard I/O streams. This defaults to stderr.
 	ErrorOutputPaths []string
 
-	// RotateOutputPath is the path to a rotating log file. This file should
-	// be automatically rotated over time, based on the rotation parameters such
-	// as RotationMaxSize and RotationMaxAge. The default is to not rotate.
-	//
-	// This path is used as a foundational path. This is where log output is normally
-	// saved. When a rotation needs to take place because the file got too big or too
-	// old, then the file is renamed by appending a timestamp to the name. Such renamed
-	// files are called backups. Once a backup has been created,
-	// output resumes to this path.
-	RotateOutputPath string
-
-	// RotationMaxSize is the maximum size in megabytes of a log file before it gets
-	// rotated. It defaults to 100 megabytes.
-	RotationMaxSize int
-
-	// RotationMaxAge is the maximum number of days to retain old log files based on the
-	// timestamp encoded in their filename. Note that a day is defined as 24
-	// hours and may not exactly correspond to calendar days due to daylight
-	// savings, leap seconds, etc. The default is to remove log files
-	// older than 30 days.
-	RotationMaxAge int
-
-	// RotationMaxBackups is the maximum number of old log files to retain.  The default
-	// is to retain at most 1000 logs.
-	RotationMaxBackups int
-
 	// JSONEncoding controls whether the log is formatted as JSON.
 	JSONEncoding bool
 
-	// IncludeCallerSourceLocation determines whether log messages include the source location of the caller.
-	IncludeCallerSourceLocation bool
+	// logGRPC indicates that Grpc logs should be captured.
+	// This is enabled by a --log_output_level=grpc:<level> typically
+	logGRPC bool
 
-	// LogGrpc indicates that Grpc logs should be captured. The default is true.
-	// This is not exposed through the command-line flags, as this flag is mainly useful for testing: Grpc
-	// stack will hold on to the logger even though it gets closed. This causes data races.
-	LogGrpc bool
+	outputLevels        string
+	defaultOutputLevels string
+	logCallers          string
+	stackTraceLevels    string
 
-	stackTraceLevel string
-	outputLevel     string
+	useStackdriverFormat bool
+	extensions           []Extension
 }
 
-// NewOptions returns a new set of options, initialized to the defaults
-func NewOptions() *Options {
+// DefaultOptions returns a new set of options, initialized to the defaults
+func DefaultOptions() *Options {
 	return &Options{
-		OutputPaths:        []string{defaultOutputPath},
-		ErrorOutputPaths:   []string{defaultErrorOutputPath},
-		RotationMaxSize:    defaultRotationMaxSize,
-		RotationMaxAge:     defaultRotationMaxAge,
-		RotationMaxBackups: defaultRotationMaxBackups,
-		outputLevel:        string(defaultOutputLevel),
-		stackTraceLevel:    string(defaultStackTraceLevel),
-		LogGrpc:            true,
+		OutputPaths:          []string{defaultOutputPath},
+		ErrorOutputPaths:     []string{defaultErrorOutputPath},
+		defaultOutputLevels:  "default:info,grpc:none",
+		stackTraceLevels:     DefaultScopeName + ":" + levelToString[defaultStackTraceLevel],
+		logGRPC:              false,
+		useStackdriverFormat: false,
 	}
 }
 
-func isValid(level Level) bool {
-	switch level {
-	case DebugLevel, InfoLevel, WarnLevel, ErrorLevel, NoneLevel:
-		return true
-	default:
-		return false
-	}
+// WithStackdriverLoggingFormat configures logging output to match Stackdriver structured logging conventions.
+func (o *Options) WithStackdriverLoggingFormat() *Options {
+	o.useStackdriverFormat = true
+	return o
 }
 
-// SetOutputLevel sets the minimum log output level.
-func (o *Options) SetOutputLevel(level Level) error {
-	if ok := isValid(level); !ok {
-		return fmt.Errorf("unknown output level: %v", level)
-	}
-	o.outputLevel = string(level)
-	return nil
+// WithTeeToUDS configures a parallel logging pipeline that writes logs to a server over UDS.
+// addr is the socket that the server listens on, and path is the HTTP path that process the log message.
+func (o *Options) WithTeeToUDS(addr, path string) *Options {
+	return o.WithExtension(func(c zapcore.Core) (zapcore.Core, func() error, error) {
+		return teeToUDSServer(c, addr, path), func() error { return nil }, nil
+	})
 }
 
-// GetOutputLevel returns the minimum log output level.
-func (o *Options) GetOutputLevel() (Level, error) {
-	l := Level(o.outputLevel)
-	if ok := isValid(l); !ok {
-		return "", fmt.Errorf("unknown output level: %v", l)
-	}
-	return l, nil
+// WithTeeToRolling configures a parallel logging pipeline that writes logs to a local rolling log of fixed size.
+// This is mainly used by the CNI plugin, and so the size and rollover is intentionally kept small.
+// rollingPath is the path the rolling log(s) will be written to.
+func (o *Options) WithTeeToRollingLocal(rollingPath string, maxSizeInMB int) *Options {
+	return o.WithExtension(func(c zapcore.Core) (zapcore.Core, func() error, error) {
+		return teeToRollingLocal(c, rollingPath, maxSizeInMB), func() error { return nil }, nil
+	})
 }
 
-// SetStackTraceLevel sets the minimum stack trace capture level.
-func (o *Options) SetStackTraceLevel(level Level) error {
-	if ok := isValid(level); !ok {
-		return fmt.Errorf("unknown stack trace level: %v", level)
-	}
-	o.stackTraceLevel = string(level)
-	return nil
+// Extension provides an extension mechanism for logs.
+// This is essentially like https://pkg.go.dev/golang.org/x/exp/slog#Handler.
+// This interface should be considered unstable; we will likely swap it for slog in the future and not expose zap internals.
+// Returns a modified Core interface, and a Close() function.
+type Extension func(c zapcore.Core) (zapcore.Core, func() error, error)
+
+func (o *Options) WithExtension(e Extension) *Options {
+	o.extensions = append(o.extensions, e)
+	return o
 }
 
-// GetStackTraceLevel returns the current stack trace level.
-func (o *Options) GetStackTraceLevel() (Level, error) {
-	l := Level(o.stackTraceLevel)
-	if ok := isValid(l); !ok {
-		return "", fmt.Errorf("unknown stack trace level: %v", l)
+// SetDefaultOutputLevel sets the minimum log output level for a given scope.
+// This can be overwritten by flags
+func (o *Options) SetDefaultOutputLevel(scope string, level Level) {
+	sl := scope + ":" + levelToString[level]
+	levels := strings.Split(o.defaultOutputLevels, ",")
+	if scope == DefaultScopeName {
+		// see if we have an entry without a scope prefix (which represents the default scope)
+		for i, ol := range levels {
+			if !strings.Contains(ol, ":") {
+				levels[i] = sl
+				o.defaultOutputLevels = strings.Join(levels, ",")
+				return
+			}
+		}
 	}
-	return l, nil
+
+	prefix := scope + ":"
+	for i, ol := range levels {
+		if strings.HasPrefix(ol, prefix) {
+			levels[i] = sl
+			o.defaultOutputLevels = strings.Join(levels, ",")
+			return
+		}
+	}
+
+	levels = append(levels, sl)
+	o.defaultOutputLevels = strings.Join(levels, ",")
+}
+
+func convertScopedLevel(sl string) (string, Level, error) {
+	var s string
+	var l string
+
+	pieces := strings.Split(sl, ":")
+	if len(pieces) == 1 {
+		s = DefaultScopeName
+		l = pieces[0]
+	} else if len(pieces) == 2 {
+		s = pieces[0]
+		l = pieces[1]
+	} else {
+		return "", NoneLevel, fmt.Errorf("invalid output level format '%s'", sl)
+	}
+
+	level, ok := stringToLevel[l]
+	if !ok {
+		return "", NoneLevel, fmt.Errorf("invalid output level '%s'", l)
+	}
+
+	return s, level, nil
 }
 
 // AttachCobraFlags attaches a set of Cobra flags to the given Cobra command.
@@ -164,49 +208,69 @@ func (o *Options) GetStackTraceLevel() (Level, error) {
 // the necessary set of flags to expose a CLI to let the user control all
 // logging options.
 func (o *Options) AttachCobraFlags(cmd *cobra.Command) {
-	cmd.PersistentFlags().StringArrayVar(&o.OutputPaths, "log_target", o.OutputPaths,
+	o.AttachFlags(
+		cmd.PersistentFlags().StringArrayVar,
+		cmd.PersistentFlags().StringVar,
+		cmd.PersistentFlags().IntVar,
+		cmd.PersistentFlags().BoolVar)
+}
+
+// AttachFlags allows attaching of flags through a set of lambda functions.
+func (o *Options) AttachFlags(
+	stringArrayVar func(p *[]string, name string, value []string, usage string),
+	stringVar func(p *string, name string, value string, usage string),
+	_ func(p *int, name string, value int, usage string),
+	boolVar func(p *bool, name string, value bool, usage string),
+) {
+	stringArrayVar(&o.OutputPaths, "log_target", o.OutputPaths,
 		"The set of paths where to output the log. This can be any path as well as the special values stdout and stderr")
 
-	cmd.PersistentFlags().StringVar(&o.RotateOutputPath, "log_rotate", o.RotateOutputPath,
-		"The path for the optional rotating log file")
-
-	cmd.PersistentFlags().IntVar(&o.RotationMaxAge, "log_rotate_max_age", o.RotationMaxAge,
-		"The maximum age in days of a log file beyond which the file is rotated (0 indicates no limit)")
-
-	cmd.PersistentFlags().IntVar(&o.RotationMaxSize, "log_rotate_max_size", o.RotationMaxSize,
-		"The maximum size in megabytes of a log file beyond which the file is rotated")
-
-	cmd.PersistentFlags().IntVar(&o.RotationMaxBackups, "log_rotate_max_backups", o.RotationMaxBackups,
-		"The maximum number of log file backups to keep before older files are deleted (0 indicates no limit)")
-
-	cmd.PersistentFlags().BoolVar(&o.JSONEncoding, "log_as_json", o.JSONEncoding,
+	boolVar(&o.JSONEncoding, "log_as_json", o.JSONEncoding,
 		"Whether to format output as JSON or in plain console-friendly format")
 
-	cmd.PersistentFlags().StringVar(&o.outputLevel, "log_output_level", o.outputLevel,
-		fmt.Sprintf("The minimum logging level of messages to output, can be one of %q, %q, %q, %q, or %q",
-			DebugLevel, InfoLevel, WarnLevel, ErrorLevel, NoneLevel))
+	levelListString := fmt.Sprintf("[%s, %s, %s, %s, %s, %s]",
+		levelToString[DebugLevel],
+		levelToString[InfoLevel],
+		levelToString[WarnLevel],
+		levelToString[ErrorLevel],
+		levelToString[FatalLevel],
+		levelToString[NoneLevel])
 
-	cmd.PersistentFlags().BoolVar(&o.IncludeCallerSourceLocation, "log_callers", o.IncludeCallerSourceLocation,
-		"Include caller information, useful for debugging")
+	allScopes := Scopes()
+	if len(allScopes) > 1 {
+		keys := make([]string, 0, len(allScopes))
+		for name := range allScopes {
+			keys = append(keys, name)
+		}
+		keys = append(keys, OverrideScopeName)
+		sort.Strings(keys)
+		s := strings.Join(keys, ", ")
 
-	cmd.PersistentFlags().StringVar(&o.stackTraceLevel, "log_stacktrace_level", o.stackTraceLevel,
-		fmt.Sprintf("The minimum logging level at which stack traces are captured, can be one of %q, %q, %q, %q, or %q",
-			DebugLevel, InfoLevel, WarnLevel, ErrorLevel, NoneLevel))
+		stringVar(&o.outputLevels, "log_output_level", o.outputLevels,
+			fmt.Sprintf("Comma-separated minimum per-scope logging level of messages to output, in the form of "+
+				"<scope>:<level>,<scope>:<level>,... where scope can be one of [%s] and level can be one of %s",
+				s, levelListString))
+
+		stringVar(&o.stackTraceLevels, "log_stacktrace_level", o.stackTraceLevels,
+			fmt.Sprintf("Comma-separated minimum per-scope logging level at which stack traces are captured, in the form of "+
+				"<scope>:<level>,<scope:level>,... where scope can be one of [%s] and level can be one of %s",
+				s, levelListString))
+
+		stringVar(&o.logCallers, "log_caller", o.logCallers,
+			fmt.Sprintf("Comma-separated list of scopes for which to include caller information, scopes can be any of [%s]", s))
+	} else {
+		stringVar(&o.outputLevels, "log_output_level", o.outputLevels,
+			fmt.Sprintf("The minimum logging level of messages to output,  can be one of %s",
+				levelListString))
+
+		stringVar(&o.stackTraceLevels, "log_stacktrace_level", o.stackTraceLevels,
+			fmt.Sprintf("The minimum logging level at which stack traces are captured, can be one of %s",
+				levelListString))
+
+		stringVar(&o.logCallers, "log_caller", o.logCallers,
+			"Comma-separated list of scopes for which to include called information, scopes can be any of [default]")
+	}
 
 	// NOTE: we don't currently expose a command-line option to control ErrorOutputPaths since it
 	// seems too esoteric.
-
-	// TODO: Remove all this stuff by the 1.0 release
-	var dummy string
-	var dummy2 bool
-	cmd.PersistentFlags().StringVarP(&dummy, "v", "v", "", "deprecated")
-	cmd.PersistentFlags().StringVarP(&dummy, "stderrthreshold", "", "", "deprecated")
-	cmd.PersistentFlags().BoolVarP(&dummy2, "alsologtostderr", "", false, "deprecated")
-	cmd.PersistentFlags().BoolVarP(&dummy2, "logtostderr", "", false, "deprecated")
-
-	_ = cmd.PersistentFlags().MarkDeprecated("v", "please use --log_output_level instead")
-	_ = cmd.PersistentFlags().MarkShorthandDeprecated("v", "please use --log_output_level instead")
-	_ = cmd.PersistentFlags().MarkDeprecated("stderrthreshold", "please use --log_output_level instead")
-	_ = cmd.PersistentFlags().MarkDeprecated("logtostderr", "please use --log_target instead")
-	_ = cmd.PersistentFlags().MarkDeprecated("alsologtostderr", "please use --log_target instead")
 }

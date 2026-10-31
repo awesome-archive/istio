@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,48 +12,77 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package aggregate implements a type-aggregator for config stores.  The
-// aggregate config store multiplexes requests to a configuration store based
-// on the type of the configuration objects. The aggregate config store cache
-// performs the reverse, by aggregating events from the multiplexed stores and
-// dispatching them back to event handlers.
+// Package aggregate implements a read-only aggregator for config stores.
 package aggregate
 
 import (
 	"errors"
-	"fmt"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/kube/krt"
 )
 
-// Make creates an aggregate config store from several config stores and
+var errorUnsupported = errors.New("unsupported operation: the config aggregator is read-only")
+
+// makeStore creates an aggregate config store from several config stores and
 // unifies their descriptors
-func Make(stores []model.ConfigStore) (model.ConfigStore, error) {
-	union := model.ConfigDescriptor{}
-	storeTypes := make(map[string]model.ConfigStore)
+func makeStore(stores []model.ConfigStoreController, writer model.ConfigStoreController) (*store, error) {
+	stop := make(chan struct{})
+	union := collection.NewSchemasBuilder()
+	storeTypes := make(map[config.GroupVersionKind][]model.ConfigStoreController)
 	for _, store := range stores {
-		for _, descriptor := range store.ConfigDescriptor() {
-			union = append(union, descriptor)
-			storeTypes[descriptor.Type] = store
+		for _, s := range store.Schemas().All() {
+			if len(storeTypes[s.GroupVersionKind()]) == 0 {
+				if err := union.Add(s); err != nil {
+					return nil, err
+				}
+			}
+			storeTypes[s.GroupVersionKind()] = append(storeTypes[s.GroupVersionKind()], store)
 		}
 	}
-	if err := union.Validate(); err != nil {
+
+	schemas := union.Build()
+	if err := schemas.Validate(); err != nil {
 		return nil, err
 	}
-	return &store{
-		descriptor: union,
+
+	kopts := krt.NewOptionsBuilder(stop, "aggregate", krt.GlobalDebugHandler)
+	kindStores := make(map[config.GroupVersionKind]kindStore)
+	for _, schema := range schemas.All() {
+		gvk := schema.GroupVersionKind()
+		schemaCollections := make([]krt.Collection[config.Config], 0, len(storeTypes[gvk]))
+		for _, store := range storeTypes[gvk] {
+			collection := store.KrtCollection(gvk)
+			if collection != nil {
+				schemaCollections = append(schemaCollections, collection)
+			}
+		}
+		if len(schemaCollections) != 0 {
+			collection := krt.JoinCollection(schemaCollections, kopts.WithName(gvk.Kind)...)
+			kindStores[gvk] = kindStore{
+				collection: collection,
+				index:      krt.NewNamespaceIndex(collection),
+			}
+		}
+	}
+
+	result := &store{
+		schemas:    schemas,
 		stores:     storeTypes,
-	}, nil
+		kindStores: kindStores,
+		writer:     writer,
+		stop:       stop,
+	}
+
+	return result, nil
 }
 
-// MakeCache creates an aggregate config store cache from several config store
-// caches.
-func MakeCache(caches []model.ConfigStoreCache) (model.ConfigStoreCache, error) {
-	stores := make([]model.ConfigStore, 0, len(caches))
-	for _, cache := range caches {
-		stores = append(stores, cache)
-	}
-	store, err := Make(stores)
+// MakeWriteableCache creates an aggregate config store cache from several config store caches. An additional
+// `writer` config store is passed, which may or may not be part of `caches`.
+func MakeWriteableCache(caches []model.ConfigStoreController, writer model.ConfigStoreController) (model.ConfigStoreController, error) {
+	store, err := makeStore(caches, writer)
 	if err != nil {
 		return nil, err
 	}
@@ -63,85 +92,91 @@ func MakeCache(caches []model.ConfigStoreCache) (model.ConfigStoreCache, error) 
 	}, nil
 }
 
+// MakeCache creates an aggregate config store cache from several config store
+// caches.
+func MakeCache(caches []model.ConfigStoreController) (model.ConfigStoreController, error) {
+	return MakeWriteableCache(caches, nil)
+}
+
 type store struct {
-	// descriptor is the unified
-	descriptor model.ConfigDescriptor
+	// schemas is the unified
+	schemas collection.Schemas
 
 	// stores is a mapping from config type to a store
-	stores map[string]model.ConfigStore
+	stores map[config.GroupVersionKind][]model.ConfigStoreController
+
+	kindStores map[config.GroupVersionKind]kindStore
+
+	writer model.ConfigStoreController
+	stop   chan struct{}
 }
 
-func (cr *store) ConfigDescriptor() model.ConfigDescriptor {
-	return cr.descriptor
+type kindStore struct {
+	collection krt.Collection[config.Config]
+	index      krt.Index[string, config.Config]
 }
 
-func (cr *store) Get(typ, name, namespace string) (*model.Config, bool) {
-	store, exists := cr.stores[typ]
-	if !exists {
-		return nil, false
+func (cr *store) Schemas() collection.Schemas {
+	return cr.schemas
+}
+
+// Get the first config found in the stores.
+func (cr *store) Get(typ config.GroupVersionKind, name, namespace string) *config.Config {
+	if kindStore, ok := cr.kindStores[typ]; ok {
+		key := name
+		if len(namespace) > 0 {
+			key = namespace + "/" + name
+		}
+
+		return kindStore.collection.GetKey(key)
 	}
-	return store.Get(typ, name, namespace)
+
+	return nil
 }
 
-func (cr *store) List(typ, namespace string) ([]model.Config, error) {
-	store, exists := cr.stores[typ]
-	if !exists {
-		return nil, nil
+// List all configs in the stores.
+func (cr *store) List(typ config.GroupVersionKind, namespace string) []config.Config {
+	if kindStore, ok := cr.kindStores[typ]; ok {
+		if namespace == model.NamespaceAll {
+			return kindStore.collection.List()
+		}
+		return kindStore.index.Lookup(namespace)
 	}
-	return store.List(typ, namespace)
+
+	return nil
 }
 
-func (cr *store) Delete(typ, name, namespace string) error {
-	store, exists := cr.stores[typ]
-	if !exists {
-		return fmt.Errorf("missing type %q", typ)
+func (cr *store) Delete(typ config.GroupVersionKind, name, namespace string, resourceVersion *string) error {
+	if cr.writer == nil {
+		return errorUnsupported
 	}
-	return store.Delete(typ, name, namespace)
+	return cr.writer.Delete(typ, name, namespace, resourceVersion)
 }
 
-func (cr *store) Create(config model.Config) (string, error) {
-	store, exists := cr.stores[config.Type]
-	if !exists {
-		return "", errors.New("missing type")
+func (cr *store) Create(c config.Config) (string, error) {
+	if cr.writer == nil {
+		return "", errorUnsupported
 	}
-	return store.Create(config)
+	return cr.writer.Create(c)
 }
 
-func (cr *store) Update(config model.Config) (string, error) {
-	store, exists := cr.stores[config.Type]
-	if !exists {
-		return "", errors.New("missing type")
+func (cr *store) Update(c config.Config) (string, error) {
+	if cr.writer == nil {
+		return "", errorUnsupported
 	}
-	return store.Update(config)
+	return cr.writer.Update(c)
+}
+
+func (cr *store) UpdateStatus(c config.Config) (string, error) {
+	if cr.writer == nil {
+		return "", errorUnsupported
+	}
+	return cr.writer.UpdateStatus(c)
 }
 
 type storeCache struct {
-	store  model.ConfigStore
-	caches []model.ConfigStoreCache
-}
-
-func (cr *storeCache) ConfigDescriptor() model.ConfigDescriptor {
-	return cr.store.ConfigDescriptor()
-}
-
-func (cr *storeCache) Get(typ, name, namespace string) (config *model.Config, exists bool) {
-	return cr.store.Get(typ, name, namespace)
-}
-
-func (cr *storeCache) List(typ, namespace string) ([]model.Config, error) {
-	return cr.store.List(typ, namespace)
-}
-
-func (cr *storeCache) Create(config model.Config) (string, error) {
-	return cr.store.Create(config)
-}
-
-func (cr *storeCache) Update(config model.Config) (string, error) {
-	return cr.store.Update(config)
-}
-
-func (cr *storeCache) Delete(typ, name, namespace string) error {
-	return cr.store.Delete(typ, name, namespace)
+	*store
+	caches []model.ConfigStoreController
 }
 
 func (cr *storeCache) HasSynced() bool {
@@ -150,14 +185,20 @@ func (cr *storeCache) HasSynced() bool {
 			return false
 		}
 	}
+
+	for _, kindStore := range cr.kindStores {
+		if !kindStore.collection.HasSynced() {
+			return false
+		}
+	}
+
 	return true
 }
 
-func (cr *storeCache) RegisterEventHandler(typ string, handler func(model.Config, model.Event)) {
+func (cr *storeCache) RegisterEventHandler(kind config.GroupVersionKind, handler model.EventHandler) {
 	for _, cache := range cr.caches {
-		if _, exists := cache.ConfigDescriptor().GetByType(typ); exists {
-			cache.RegisterEventHandler(typ, handler)
-			return
+		if _, exists := cache.Schemas().FindByGroupVersionKind(kind); exists {
+			cache.RegisterEventHandler(kind, handler)
 		}
 	}
 }
@@ -167,4 +208,13 @@ func (cr *storeCache) Run(stop <-chan struct{}) {
 		go cache.Run(stop)
 	}
 	<-stop
+	close(cr.stop)
+}
+
+func (cr *storeCache) KrtCollection(gvk config.GroupVersionKind) krt.Collection[config.Config] {
+	if kindStore, ok := cr.store.kindStores[gvk]; ok {
+		return kindStore.collection
+	}
+
+	return nil
 }

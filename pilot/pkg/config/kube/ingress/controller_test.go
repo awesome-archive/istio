@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,261 +15,361 @@
 package ingress
 
 import (
-	"reflect"
-	"sync"
 	"testing"
 	"time"
 
-	"k8s.io/api/extensions/v1beta1"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/kubernetes/fake"
+	corev1 "k8s.io/api/core/v1"
+	knetworking "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
-	routing "istio.io/api/routing/v1alpha1"
+	meshconfig "istio.io/api/mesh/v1alpha1"
+	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/serviceregistry/kube"
-	"istio.io/istio/pilot/test/mock"
-	"istio.io/istio/pilot/test/util"
+	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
+	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/kclient/clienttest"
+	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/istio/pkg/util/sets"
 )
 
-const (
-	resync    = 1 * time.Second
-	namespace = "test"
-)
+type fakeXdsUpdater struct {
+	Events chan sets.Set[model.ConfigKey]
+}
 
-var (
-	// Create an ingress resource of a different class,
-	// So that we can later verify it doesn't generate a notification,
-	// nor returned with List(), Get() etc.
-	nginxIngress = v1beta1.Ingress{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:      "nginx-ingress",
-			Namespace: namespace,
-			Annotations: map[string]string{
-				kube.IngressClassAnnotation: "nginx",
-			},
+var _ xdsConfigUpdater = (*fakeXdsUpdater)(nil)
+
+func (f *fakeXdsUpdater) ConfigUpdate(pr *model.PushRequest) {
+	f.Events <- pr.ConfigsUpdated
+}
+
+func newFakeXds() *fakeXdsUpdater {
+	return &fakeXdsUpdater{
+		Events: make(chan sets.Set[model.ConfigKey], 100),
+	}
+}
+
+func setupController(t *testing.T, domainPrefix string, objs ...runtime.Object) (*Controller, kube.Client) {
+	kc := kube.NewFakeClient(objs...)
+	stop := test.NewStop(t)
+
+	mc := &meshconfig.MeshConfig{
+		IngressControllerMode: meshconfig.MeshConfig_DEFAULT,
+	}
+
+	meshHolder := meshwatcher.NewTestWatcher(mc)
+	controller := NewController(
+		kc,
+		meshHolder,
+		kubecontroller.Options{
+			DomainSuffix: domainPrefix,
+			KrtDebugger:  krt.GlobalDebugHandler,
 		},
-		Spec: v1beta1.IngressSpec{
-			Backend: &v1beta1.IngressBackend{
-				ServiceName: "service1",
-				ServicePort: intstr.FromInt(80),
-			},
-		},
+		newFakeXds())
+	kc.RunAndWait(stop)
+	go controller.Run(stop)
+	kube.WaitForCacheSync("test", stop, controller.HasSynced)
+
+	return controller, kc
+}
+
+// vsNames returns the sorted set of VS names from the controller's output collection.
+func vsNames(controller *Controller) sets.String {
+	return sets.New(slices.Map(controller.outputs.VirtualServices.List(), func(c config.Config) string {
+		return c.Name
+	})...)
+}
+
+// waitForGatewayEvent waits for a Gateway push event from the xdsUpdater.
+func waitForGatewayEvent(t *testing.T, xdsUpdater *fakeXdsUpdater, wanted sets.Set[model.ConfigKey]) {
+	t.Helper()
+	select {
+	case x := <-xdsUpdater.Events:
+		if !x.Equals(wanted) {
+			t.Errorf("received unexpected gateway configs want: %v, got: %v", wanted, x)
+		}
+	case <-time.After(time.Second * 10):
+		t.Fatalf("timed out waiting for gateway event")
 	}
-	ingress = v1beta1.Ingress{
-		ObjectMeta: meta_v1.ObjectMeta{
-			Name:      "test-ingress",
-			Namespace: namespace,
-			Annotations: map[string]string{
-				kube.IngressClassAnnotation: "istio",
-			},
-		},
-		Spec: v1beta1.IngressSpec{
-			Backend: &v1beta1.IngressBackend{
-				ServiceName: "default-service",
-				ServicePort: intstr.FromInt(80),
-			},
-			TLS: []v1beta1.IngressTLS{
-				{
-					Hosts:      []string{"host1.com"},
-					SecretName: "my-secret1",
-				},
-				{
-					Hosts:      []string{"host2.com"},
-					SecretName: "my-secret2",
-				},
-			},
-			Rules: []v1beta1.IngressRule{
-				{
-					Host: "host1.com",
-					IngressRuleValue: v1beta1.IngressRuleValue{
-						HTTP: &v1beta1.HTTPIngressRuleValue{
-							Paths: []v1beta1.HTTPIngressPath{
-								{
-									Path: "/path1/.*",
-									Backend: v1beta1.IngressBackend{
-										ServiceName: "service1",
-										ServicePort: intstr.FromInt(80),
-									},
-								},
-								{
-									Path: "/path\\d",
-									Backend: v1beta1.IngressBackend{
-										ServiceName: "service2",
-										ServicePort: intstr.FromString("http"),
-									},
-								},
-							},
-						},
-					},
-				},
-				{
-					Host: "host2.com",
-					IngressRuleValue: v1beta1.IngressRuleValue{
-						HTTP: &v1beta1.HTTPIngressRuleValue{
-							Paths: []v1beta1.HTTPIngressPath{
-								{
-									Path: "/path3",
-									Backend: v1beta1.IngressBackend{
-										ServiceName: "service3",
-										ServicePort: intstr.FromInt(80),
-									},
-								},
-								{
-									Path: "/path4",
-									Backend: v1beta1.IngressBackend{
-										ServiceName: "service4",
-										ServicePort: intstr.FromInt(80),
-									},
-								},
-							},
-						},
-					},
-				},
-				{
-					Host: "host3.com",
-				},
-			},
-		},
-	}
-)
-
-func TestConfig(t *testing.T) {
-	cl := fake.NewSimpleClientset()
-	mesh := model.DefaultMeshConfig()
-	ctl := NewController(cl, &mesh, kube.ControllerOptions{
-		WatchedNamespace: namespace,
-		ResyncPeriod:     resync,
-	})
-
-	stop := make(chan struct{})
-	go ctl.Run(stop)
-
-	if len(ctl.ConfigDescriptor()) == 0 {
-		t.Errorf("must support ingress type")
-	}
-
-	rule := model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Type:      model.IngressRule.Type,
-			Name:      "test",
-			Namespace: namespace,
-		},
-		Spec: mock.ExampleIngressRule,
-	}
-
-	// make sure all operations error out
-	if _, err := ctl.Create(rule); err == nil {
-		t.Errorf("Post should not be allowed")
-	}
-
-	if _, err := ctl.Update(rule); err == nil {
-		t.Errorf("Put should not be allowed")
-	}
-
-	if err := ctl.Delete(model.IngressRule.Type, "test", namespace); err == nil {
-		t.Errorf("Delete should not be allowed")
-	}
-
-	util.Eventually(ctl.HasSynced, t)
 }
 
 func TestIngressController(t *testing.T) {
-	cl := fake.NewSimpleClientset()
-	mesh := model.DefaultMeshConfig()
-	ctl := NewController(cl, &mesh, kube.ControllerOptions{
-		WatchedNamespace: namespace,
-		ResyncPeriod:     resync,
-	})
-
-	// Append an ingress notification handler that just counts number of notifications
-	stop := make(chan struct{})
-
-	lock := sync.Mutex{}
-	notificationCount := 0
-	ctl.RegisterEventHandler(model.IngressRule.Type, func(config model.Config, ev model.Event) {
-
-		lock.Lock()
-		defer lock.Unlock()
-
-		notificationCount++
-	})
-	go ctl.Run(stop)
-
-	if _, err := cl.ExtensionsV1beta1().Ingresses(nginxIngress.Namespace).Create(&nginxIngress); err != nil {
-		t.Errorf("Cannot create ingress in namespace %s (error: %v)", nginxIngress.Namespace, err)
+	ingress1 := knetworking.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "mock", // goes into backend full name
+			Name:      "test",
+		},
+		Spec: knetworking.IngressSpec{
+			Rules: []knetworking.IngressRule{
+				{
+					Host: "my.host.com",
+					IngressRuleValue: knetworking.IngressRuleValue{
+						HTTP: &knetworking.HTTPIngressRuleValue{
+							Paths: []knetworking.HTTPIngressPath{
+								{
+									Path: "/test",
+									Backend: knetworking.IngressBackend{
+										Service: &knetworking.IngressServiceBackend{
+											Name: "foo",
+											Port: knetworking.ServiceBackendPort{
+												Number: 8000,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Host: "my2.host.com",
+					IngressRuleValue: knetworking.IngressRuleValue{
+						HTTP: &knetworking.HTTPIngressRuleValue{
+							Paths: []knetworking.HTTPIngressPath{
+								{
+									Path: "/test1.*",
+									Backend: knetworking.IngressBackend{
+										Service: &knetworking.IngressServiceBackend{
+											Name: "bar",
+											Port: knetworking.ServiceBackendPort{
+												Number: 8000,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Host: "my3.host.com",
+					IngressRuleValue: knetworking.IngressRuleValue{
+						HTTP: &knetworking.HTTPIngressRuleValue{
+							Paths: []knetworking.HTTPIngressPath{
+								{
+									Path: "/test/*",
+									Backend: knetworking.IngressBackend{
+										Service: &knetworking.IngressServiceBackend{
+											Name: "bar",
+											Port: knetworking.ServiceBackendPort{
+												Number: 8000,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
-	// Create a "real" ingress resource, with 4 host/path rules and an additional "default" rule.
-	const expectedRuleCount = 5
-	if _, err := cl.ExtensionsV1beta1().Ingresses(namespace).Create(&ingress); err != nil {
-		t.Errorf("Cannot create ingress in namespace %s (error: %v)", namespace, err)
+	ingress2 := knetworking.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "mock",
+			Name:      "test",
+		},
+		Spec: knetworking.IngressSpec{
+			Rules: []knetworking.IngressRule{
+				{
+					Host: "my.host.com",
+					IngressRuleValue: knetworking.IngressRuleValue{
+						HTTP: &knetworking.HTTPIngressRuleValue{
+							Paths: []knetworking.HTTPIngressPath{
+								{
+									Path: "/test2",
+									Backend: knetworking.IngressBackend{
+										Service: &knetworking.IngressServiceBackend{
+											Name: "foo",
+											Port: knetworking.ServiceBackendPort{
+												Number: 8000,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
-	util.Eventually(func() bool {
+	controller, client := setupController(t, "")
+	xdsUpdater := controller.xdsUpdater.(*fakeXdsUpdater)
+	ingress := clienttest.NewWriter[*knetworking.Ingress](t, client)
 
-		lock.Lock()
-		defer lock.Unlock()
+	ingress.Create(&ingress1)
 
-		return notificationCount == expectedRuleCount
-	}, t)
-	if notificationCount != expectedRuleCount {
-		t.Errorf("expected %d IngressRule events to be notified, found %d", expectedRuleCount, notificationCount)
+	// Verify gateway push event
+	waitForGatewayEvent(t, xdsUpdater, sets.New(
+		model.ConfigKey{
+			Kind:      kind.Gateway,
+			Name:      ingress1.Name + "-" + constants.IstioIngressGatewayName + "-" + ingress1.Namespace,
+			Namespace: IngressNamespace,
+		},
+	))
+
+	// Verify virtual services are produced in the output collection
+	assert.EventuallyEqual(t, func() sets.String {
+		return vsNames(controller)
+	}, sets.New(
+		"my-host-com"+"-"+ingress1.Name+"-"+constants.IstioIngressGatewayName,
+		"my2-host-com"+"-"+ingress1.Name+"-"+constants.IstioIngressGatewayName,
+		"my3-host-com"+"-"+ingress1.Name+"-"+constants.IstioIngressGatewayName,
+	), retry.Timeout(time.Second*10))
+
+	ingress.Update(&ingress2)
+
+	// After update, only 1 host remains
+	assert.EventuallyEqual(t, func() sets.String {
+		return vsNames(controller)
+	}, sets.New(
+		"my-host-com"+"-"+ingress2.Name+"-"+constants.IstioIngressGatewayName,
+	), retry.Timeout(time.Second*10))
+}
+
+func TestIngressControllerWithPortName(t *testing.T) {
+	ingressConfig := knetworking.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "mock",
+			Name:      "test",
+		},
+		Spec: knetworking.IngressSpec{
+			Rules: []knetworking.IngressRule{
+				{
+					Host: "my.host.com",
+					IngressRuleValue: knetworking.IngressRuleValue{
+						HTTP: &knetworking.HTTPIngressRuleValue{
+							Paths: []knetworking.HTTPIngressPath{
+								{
+									Path: "/foo",
+									Backend: knetworking.IngressBackend{
+										Service: &knetworking.IngressServiceBackend{
+											Name: "foo",
+											Port: knetworking.ServiceBackendPort{
+												Number: 8000,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Host: "my2.host.com",
+					IngressRuleValue: knetworking.IngressRuleValue{
+						HTTP: &knetworking.HTTPIngressRuleValue{
+							Paths: []knetworking.HTTPIngressPath{
+								{
+									Path: "/bar",
+									Backend: knetworking.IngressBackend{
+										Service: &knetworking.IngressServiceBackend{
+											Name: "bar",
+											Port: knetworking.ServiceBackendPort{
+												Name: "http",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
-	util.Eventually(func() bool {
-		rules, _ := ctl.List(model.IngressRule.Type, namespace)
-		return len(rules) == expectedRuleCount
-	}, t)
-	rules, err := ctl.List(model.IngressRule.Type, namespace)
-	if err != nil {
-		t.Errorf("ctl.List(model.IngressRule, %s) => error: %v", namespace, err)
-	}
-	if len(rules) != expectedRuleCount {
-		t.Errorf("expected %d IngressRule objects to be created, found %d", expectedRuleCount, len(rules))
+	serviceConfig := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "mock",
+			Name:      "bar",
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Name: "http",
+					Port: 8080,
+				},
+			},
+		},
 	}
 
-	for _, listMsg := range rules {
-		getMsg, exists := ctl.Get(model.IngressRule.Type, listMsg.Name, listMsg.Namespace)
-		if !exists {
-			t.Errorf("expected IngressRule with key %v to exist", listMsg.Key())
-		} else {
-			listRule, ok := listMsg.Spec.(*routing.IngressRule)
-			if !ok {
-				t.Errorf("expected IngressRule but got %v", listMsg.Spec)
+	controller, client := setupController(t, "")
+	xdsUpdater := controller.xdsUpdater.(*fakeXdsUpdater)
+	ingress := clienttest.NewWriter[*knetworking.Ingress](t, client)
+	service := clienttest.NewWriter[*corev1.Service](t, client)
+
+	// First create ingress.
+	ingress.Create(&ingressConfig)
+
+	// Verify gateway push event
+	waitForGatewayEvent(t, xdsUpdater, sets.New(
+		model.ConfigKey{
+			Kind:      kind.Gateway,
+			Name:      ingressConfig.Name + "-" + constants.IstioIngressGatewayName + "-" + ingressConfig.Namespace,
+			Namespace: IngressNamespace,
+		},
+	))
+
+	// Verify virtual services are produced in the output collection
+	assert.EventuallyEqual(t, func() sets.String {
+		return vsNames(controller)
+	}, sets.New(
+		"my-host-com"+"-"+ingressConfig.Name+"-"+constants.IstioIngressGatewayName,
+		"my2-host-com"+"-"+ingressConfig.Name+"-"+constants.IstioIngressGatewayName,
+	), retry.Timeout(time.Second*10))
+
+	// Then we create service — this resolves the named port for the my2 VS.
+	service.Create(&serviceConfig)
+
+	// Verify the VS with the named port is updated (port resolved to 8080).
+	assert.EventuallyEqual(t, func() uint32 {
+		for _, vs := range controller.outputs.VirtualServices.List() {
+			if vs.Name == "my2-host-com"+"-"+ingressConfig.Name+"-"+constants.IstioIngressGatewayName {
+				return getVSPort(vs)
 			}
+		}
+		return 0
+	}, uint32(8080), retry.Timeout(time.Second*10))
 
-			getRule, ok := getMsg.Spec.(*routing.IngressRule)
-			if !ok {
-				t.Errorf("expected IngressRule but got %v", getMsg)
+	// We change service port number.
+	serviceConfig.Spec.Ports[0].Port = 8090
+	service.Update(&serviceConfig)
+
+	// Verify the VS is updated with the new port number.
+	assert.EventuallyEqual(t, func() uint32 {
+		for _, vs := range controller.outputs.VirtualServices.List() {
+			if vs.Name == "my2-host-com"+"-"+ingressConfig.Name+"-"+constants.IstioIngressGatewayName {
+				return getVSPort(vs)
 			}
+		}
+		return 0
+	}, uint32(8090), retry.Timeout(time.Second*10))
+}
 
-			if !reflect.DeepEqual(listRule, getRule) {
-				t.Errorf("expected Get (%v) and List (%v) to return same rule", getMsg, listMsg)
+// getVSPort extracts the port number from the first route destination of a VirtualService.
+func getVSPort(vs config.Config) uint32 {
+	spec, ok := vs.Spec.(*networking.VirtualService)
+	if !ok || len(spec.Http) == 0 {
+		return 0
+	}
+	for _, route := range spec.Http {
+		for _, dest := range route.Route {
+			if dest.Destination != nil && dest.Destination.Port != nil {
+				return dest.Destination.Port.Number
 			}
 		}
 	}
-
-	// test edge cases for Get and List
-	if _, exists := ctl.Get(model.RouteRule.Type, "test", namespace); exists {
-		t.Error("Get() => got exists for route rule")
-	}
-	if _, exists := ctl.Get(model.IngressRule.Type, ingress.Name, namespace); exists {
-		t.Error("Get() => got exists for a name without a rule path")
-	}
-	if _, exists := ctl.Get(model.IngressRule.Type, encodeIngressRuleName("blah", 0, 0), namespace); exists {
-		t.Error("Get() => got exists for a missing ingress resource")
-	}
-	if _, exists := ctl.Get(model.IngressRule.Type, encodeIngressRuleName(nginxIngress.Name, 0, 0), namespace); exists {
-		t.Error("Get() => got exists for a different class resource")
-	}
-	if _, exists := ctl.Get(model.IngressRule.Type, encodeIngressRuleName(ingress.Name, 10, 10), namespace); exists {
-		t.Error("Get() => got exists for a unreachable rule path")
-	}
-	if _, err := ctl.List(model.RouteRule.Type, namespace); err == nil {
-		t.Error("List() => got no error for route rules")
-	}
-	if elts, err := ctl.List(model.IngressRule.Type, "missing"); err != nil || len(elts) > 0 {
-		t.Errorf("List() => got %#v, %v for a missing namespace", elts, err)
-	}
+	return 0
 }

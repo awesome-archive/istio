@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,26 +25,63 @@ import (
 var (
 	buildVersion     = "unknown"
 	buildGitRevision = "unknown"
-	buildUser        = "unknown"
-	buildHost        = "unknown"
-	buildDockerHub   = "unknown"
 	buildStatus      = "unknown"
+	buildTag         = "unknown"
+	buildHub         = "unknown"
+	buildOS          = "unknown"
+	buildArch        = "unknown"
 )
 
 // BuildInfo describes version information about the binary build.
 type BuildInfo struct {
 	Version       string `json:"version"`
 	GitRevision   string `json:"revision"`
-	User          string `json:"user"`
-	Host          string `json:"host"`
 	GolangVersion string `json:"golang_version"`
-	DockerHub     string `json:"hub"`
 	BuildStatus   string `json:"status"`
+	GitTag        string `json:"tag"`
+}
+
+// ServerInfo contains the version for a single control plane component
+type ServerInfo struct {
+	Component string
+	Revision  string
+	Info      BuildInfo
+}
+
+// MeshInfo contains the versions for all Istio control plane components
+type MeshInfo []ServerInfo
+
+// NodeType decides the responsibility of the proxy serves in the mesh
+type NodeType string
+
+func ToUserFacingNodeType(t string) NodeType {
+	switch t {
+	case "router":
+		return "gateway"
+	default:
+		return NodeType(t)
+	}
+}
+
+// ProxyInfo contains the version for a single data plane component
+type ProxyInfo struct {
+	ID           string
+	IstioVersion string
+	Type         NodeType
+}
+
+// DockerBuildInfo contains and exposes Hub: buildHub, Tag: buildVersion, OS: buildOS, and Arch: buildArch
+type DockerBuildInfo struct {
+	Hub  string
+	Tag  string
+	OS   string
+	Arch string
 }
 
 var (
 	// Info exports the build version information.
-	Info BuildInfo
+	Info       BuildInfo
+	DockerInfo DockerBuildInfo
 )
 
 // String produces a single-line version info
@@ -52,55 +89,34 @@ var (
 // This looks like:
 //
 // ```
-// user@host-<docker hub>-<version>-<git revision>-<build status>
+// u<version>-<git revision>-<build status>
 // ```
 func (b BuildInfo) String() string {
-	return fmt.Sprintf("%v@%v-%v-%v-%v-%v",
-		b.User,
-		b.Host,
-		b.DockerHub,
+	return fmt.Sprintf("%v-%v-%v",
 		b.Version,
 		b.GitRevision,
 		b.BuildStatus)
 }
 
-// LongForm returns a multi-line version information
-//
+// LongForm returns a dump of the Info struct
 // This looks like:
-//
-// ```
-// Version: <version>
-// GitRevision: <git revision>
-// User: user@host
-// Hub: <docker hub>
-// GolangVersion: go1.9.2
-// BuildStatus: <build status>
-// ```
 func (b BuildInfo) LongForm() string {
-	return fmt.Sprintf(`Version: %v
-GitRevision: %v
-User: %v@%v
-Hub: %v
-GolangVersion: %v
-BuildStatus: %v
-`,
-		b.Version,
-		b.GitRevision,
-		b.User,
-		b.Host,
-		b.DockerHub,
-		b.GolangVersion,
-		b.BuildStatus)
+	return fmt.Sprintf("%#v", b)
 }
 
 func init() {
 	Info = BuildInfo{
 		Version:       buildVersion,
 		GitRevision:   buildGitRevision,
-		User:          buildUser,
-		Host:          buildHost,
 		GolangVersion: runtime.Version(),
-		DockerHub:     buildDockerHub,
 		BuildStatus:   buildStatus,
+		GitTag:        buildTag,
+	}
+
+	DockerInfo = DockerBuildInfo{
+		Hub:  buildHub,
+		Tag:  buildVersion,
+		OS:   buildOS,
+		Arch: buildArch,
 	}
 }

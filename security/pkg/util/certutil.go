@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,16 +24,24 @@ import (
 // CertUtil is an interface for utility functions on certificate.
 type CertUtil interface {
 	// GetWaitTime returns the waiting time before renewing the certificate.
-	GetWaitTime([]byte, time.Time, int) (time.Duration, error)
+	GetWaitTime([]byte, time.Time) (time.Duration, error)
 }
 
 // CertUtilImpl is the implementation of CertUtil, for production use.
 type CertUtilImpl struct {
+	gracePeriodPercentage int
 }
 
-// GetWaitTime returns the waititng time before renewing the cert, based on current time, the timestamps in cert and
-// graceperiod.
-func (cu CertUtilImpl) GetWaitTime(certBytes []byte, now time.Time, gracePeriodPercentage int) (time.Duration, error) {
+// NewCertUtil returns a new CertUtilImpl
+func NewCertUtil(gracePeriodPercentage int) CertUtilImpl {
+	return CertUtilImpl{
+		gracePeriodPercentage: gracePeriodPercentage,
+	}
+}
+
+// GetWaitTime returns the waiting time before renewing the cert, based on current time, the timestamps in cert and
+// grace period.
+func (cu CertUtilImpl) GetWaitTime(certBytes []byte, now time.Time) (time.Duration, error) {
 	cert, certErr := util.ParsePemEncodedCertificate(certBytes)
 	if certErr != nil {
 		return time.Duration(0), certErr
@@ -43,7 +51,9 @@ func (cu CertUtilImpl) GetWaitTime(certBytes []byte, now time.Time, gracePeriodP
 		return time.Duration(0), fmt.Errorf("certificate already expired at %s, but now is %s",
 			cert.NotAfter, now)
 	}
-	gracePeriod := cert.NotAfter.Sub(cert.NotBefore) * time.Duration(gracePeriodPercentage) / time.Duration(100)
+	// Note: multiply time.Duration(int64) by an int (gracePeriodPercentage) will cause overflow (e.g.,
+	// when duration is time.Hour * 90000). So float64 is used instead.
+	gracePeriod := time.Duration(float64(cert.NotAfter.Sub(cert.NotBefore)) * (float64(cu.gracePeriodPercentage) / 100))
 	// waitTime is the duration between now and the grace period starts.
 	// It is the time until cert expiration minus the length of grace period.
 	waitTime := timeToExpire - gracePeriod

@@ -1,16 +1,23 @@
 [
-	{
-		"name": "istio.io/api",
-		"repoName": "api",
-		"prodBranch": "master",
-		"file": "Gopkg.toml",
-		"lastStableSHA": "9d978d76653da8b7b4bd6421b7e8f9925d8c79ea"
-	},
-	{
-		"name": "PROXY_TAG",
-		"repoName": "proxy",
-		"prodBranch": "master",
-		"file": "istio.VERSION",
-		"lastStableSHA": "80ec4f6c2a672b00e55d34ef9b5d26a42a98da42"
-	}
+  {
+    "_comment": "",
+    "name": "PROXY_REPO_SHA",
+    "repoName": "proxy",
+    "file": "",
+    "lastStableSHA": "af6a1c71e194c7d60f82326165d58c5cef682d7b"
+  },
+  {
+    "_comment": "",
+    "name": "ZTUNNEL_REPO_SHA",
+    "repoName": "ztunnel",
+    "file": "",
+    "lastStableSHA": "837bb80aadd1a7c550c249232bfa8e6b76969658"
+  },
+  {
+    "_comment": "",
+    "name": "AGENTGATEWAY_IMAGE",
+    "repoName": "agentgateway",
+    "file": "",
+    "lastStableSHA": "v1.7.0"
+  }
 ]
